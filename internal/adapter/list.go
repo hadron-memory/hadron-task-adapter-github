@@ -234,7 +234,7 @@ type listedItem struct {
 func (l *lister) list(ctx context.Context, cursor, forWorker string, limit int) ([]listedItem, *string, error) {
 	team, ok := l.cfg.team(forWorker)
 	if !ok {
-		return nil, nil, usageErr("no team in the adapter's configuration is mapped to the worker %q", oneLine(forWorker, 80))
+		return nil, nil, usageErr("no team in the adapter's configuration is mapped to the worker %q", l.gh.clip(forWorker, 80))
 	}
 	repos := l.cfg.repos()
 	fp := l.cfg.fingerprint(forWorker)
@@ -336,7 +336,7 @@ func (l *lister) list(ctx context.Context, cursor, forWorker string, limit int) 
 func (l *lister) externalID(r repo, n issueNode) (string, error) {
 	ref, err := parseIssueURL(n.URL, l.cfg.WebHost)
 	if err != nil || ref.Key != r.Key || ref.Number != n.Number {
-		return "", fmt.Errorf("GitHub returned %q for %s/%s#%d, which is not that issue's URL", oneLine(n.URL, 120), r.Owner, r.Name, n.Number)
+		return "", fmt.Errorf("GitHub returned %q for %s/%s#%d, which is not that issue's URL", l.gh.clip(n.URL, 120), r.Owner, r.Name, n.Number)
 	}
 	if err := checkExternalID(n.URL); err != nil {
 		return "", fmt.Errorf("GitHub returned an issue URL that is not a valid external id: %v", err)

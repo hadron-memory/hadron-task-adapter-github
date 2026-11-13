@@ -18,7 +18,7 @@ func (s *session) configuredIssue(call, externalID string) (issueRef, error) {
 	}
 	ref, err := parseIssueURL(externalID, s.cfg.WebHost)
 	if err != nil {
-		return issueRef{}, usageErr("%s: %q: %v", call, oneLine(externalID, 120), err)
+		return issueRef{}, usageErr("%s: %q: %v", call, s.gh.clip(externalID, 120), err)
 	}
 	if !s.cfg.hasRepo(ref.Owner, ref.Name) {
 		return issueRef{}, usageErr("%s: %s/%s is not a repository in the adapter's configuration", call, ref.Owner, ref.Name)
@@ -223,7 +223,7 @@ func (s *session) normalize(ctx context.Context, req json.RawMessage) (any, erro
 	}
 	ref, err := s.cfg.parseShortRef(r.Ref)
 	if err != nil {
-		return nil, usageErr("normalize: %q: %v", oneLine(r.Ref, 120), err)
+		return nil, usageErr("normalize: %q: %v", s.gh.clip(r.Ref, 120), err)
 	}
 	if !s.cfg.hasRepo(ref.Owner, ref.Name) {
 		return nil, usageErr("normalize: %s/%s is not a repository in the adapter's configuration", ref.Owner, ref.Name)
@@ -270,20 +270,20 @@ func check(ctx context.Context, getenv func(string) string) any {
 	}
 	gh := newGitHub(cfg, token)
 	if _, err := gh.rest(ctx, http.MethodGet, "/rate_limit", nil, nil, http.StatusOK); err != nil {
-		results = append(results, checkResult{Name: "credential", OK: false, Detail: oneLine(err.Error(), 300)})
+		results = append(results, checkResult{Name: "credential", OK: false, Detail: gh.clip(err.Error(), 300)})
 		return answer()
 	}
 	results = append(results, checkResult{Name: "credential", OK: true})
 	for _, r := range cfg.repos() {
 		name := "repository " + r.Owner + "/" + r.Name
 		if _, err := gh.rest(ctx, http.MethodGet, "/repos/"+escapePath(r.Owner)+"/"+escapePath(r.Name), nil, nil, http.StatusOK); err != nil {
-			results = append(results, checkResult{Name: name, OK: false, Detail: oneLine(err.Error(), 300)})
+			results = append(results, checkResult{Name: name, OK: false, Detail: gh.clip(err.Error(), 300)})
 			continue
 		}
 		results = append(results, checkResult{Name: name, OK: true})
 		lname := "label " + cfg.TrackedLabel + " in " + r.Owner + "/" + r.Name
 		if _, err := gh.rest(ctx, http.MethodGet, "/repos/"+escapePath(r.Owner)+"/"+escapePath(r.Name)+"/labels/"+escapePath(cfg.TrackedLabel), nil, nil, http.StatusOK); err != nil {
-			results = append(results, checkResult{Name: lname, OK: false, Detail: "create it first (gh label create " + cfg.TrackedLabel + " -R " + r.Owner + "/" + r.Name + "): " + oneLine(err.Error(), 200)})
+			results = append(results, checkResult{Name: lname, OK: false, Detail: "create it first (gh label create " + cfg.TrackedLabel + " -R " + r.Owner + "/" + r.Name + "): " + gh.clip(err.Error(), 200)})
 			continue
 		}
 		results = append(results, checkResult{Name: lname, OK: true})

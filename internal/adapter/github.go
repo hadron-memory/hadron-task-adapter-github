@@ -46,10 +46,17 @@ func (e *apiError) Error() string {
 }
 
 func (g *githubClient) scrub(s string) string {
+	return g.clip(s, 200)
+}
+
+// clip quotes untrusted text on one line, cut to max runes, with the
+// credential scrubbed FIRST: a cut that lands inside the credential would
+// otherwise leave a prefix that no later scrub can recognise.
+func (g *githubClient) clip(s string, max int) string {
 	if g.token != "" {
 		s = strings.ReplaceAll(s, g.token, "[redacted]")
 	}
-	return oneLine(s, 200)
+	return oneLine(s, max)
 }
 
 func (g *githubClient) do(ctx context.Context, method, endpoint string, body any) (int, []byte, error) {
