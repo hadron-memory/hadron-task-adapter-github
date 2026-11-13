@@ -22,6 +22,8 @@ const (
 	// happens here, so a run of ineligible issues costs reads, not items.
 	extraFetchesPerCall = 20
 	cursorPrefix        = "v1."
+	// MaxCursorLen is the hadron CLI runner's bound on nextCursor.
+	MaxCursorLen = 4096
 )
 
 const listQuery = `query ListOpenIssues($owner:String!,$name:String!,$after:String,$first:Int!,$labelsFirst:Int!){
@@ -321,6 +323,11 @@ func (l *lister) list(ctx context.Context, cursor, forWorker string, limit int) 
 		return items, nil, nil
 	}
 	next := encodeCursor(cursorState{Query: fp, Pos: pos})
+	// The runner refuses a cursor past its bound; GitHub does not promise
+	// how long its positions are. Never answer with one that cannot be used.
+	if len(next) > MaxCursorLen {
+		return nil, nil, fmt.Errorf("the cursor would be %d bytes, more than the %d the hadron CLI accepts (GitHub's positions are unusually long); configure fewer repositories", len(next), MaxCursorLen)
+	}
 	return items, &next, nil
 }
 

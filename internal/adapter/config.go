@@ -22,7 +22,10 @@ const ConfigEnv = "TASK_ADAPTER_GITHUB_CONFIG"
 
 // Limits on the configuration.
 const (
-	MaxRepositories   = 30 // keeps the cursor inside the runner's 4096-byte bound
+	// MaxRepositories keeps the cursor inside the runner's 4096-byte bound
+	// with GitHub positions up to about 140 bytes each (real ones are about
+	// 60). A longer position refuses the call instead (list.go).
+	MaxRepositories   = 20
 	MaxLabelLen       = 100
 	MaxExcludeLabels  = 50
 	MaxTeams          = 50
@@ -140,8 +143,8 @@ func ParseConfig(b []byte) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("configuration: %v", err)
 	}
-	if dec.More() {
-		return nil, errors.New("configuration: more than one JSON value")
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("configuration: text after the JSON object")
 	}
 	if err := c.validate(); err != nil {
 		return nil, fmt.Errorf("configuration: %v", err)

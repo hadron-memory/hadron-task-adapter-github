@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -69,7 +70,8 @@ type Env struct {
 func Run(ctx context.Context, e Env) int {
 	ctx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	out, err := run(ctx, e)
+	var token string
+	out, err := run(ctx, e, &token)
 	if err == nil {
 		b, merr := json.Marshal(out)
 		if merr == nil {
@@ -85,11 +87,17 @@ func Run(ctx context.Context, e Env) int {
 	if errors.As(err, &ee) {
 		code = ee.code
 	}
-	fmt.Fprintf(e.Stderr, "%s: %s\n", Name, oneLine(err.Error(), 600))
+	// Every refusal is scrubbed of the credential, whatever its source:
+	// GitHub's error text, or data GitHub returned that the adapter refuses.
+	msg := err.Error()
+	if token != "" {
+		msg = strings.ReplaceAll(msg, token, "[redacted]")
+	}
+	fmt.Fprintf(e.Stderr, "%s: %s\n", Name, oneLine(msg, 600))
 	return code
 }
 
-func run(ctx context.Context, e Env) (any, error) {
+func run(ctx context.Context, e Env, tokenOut *string) (any, error) {
 	if len(e.Args) != 1 {
 		return nil, usageErr("expected exactly one argument, the call (one of %v)", Calls)
 	}
@@ -132,6 +140,7 @@ func run(ctx context.Context, e Env) (any, error) {
 	if err != nil {
 		return nil, configErr("%v", err)
 	}
+	*tokenOut = token
 	s := &session{cfg: cfg, gh: newGitHub(cfg, token)}
 	switch call {
 	case "list-untracked":
@@ -166,8 +175,10 @@ func readRequest(r io.Reader) (json.RawMessage, error) {
 	if err := dec.Decode(&raw); err != nil {
 		return nil, usageErr("the request is not one well-formed JSON object")
 	}
-	if dec.More() {
-		return nil, usageErr("the request carries more than one JSON value")
+	// More is not an end-of-input check: it reports false before a stray
+	// "]" or "}". Only io.EOF after the object proves nothing follows.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, usageErr("the request carries text after its JSON object")
 	}
 	return raw, nil
 }

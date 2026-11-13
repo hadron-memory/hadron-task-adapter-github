@@ -53,8 +53,11 @@ done), so nothing is re-read or skipped.
 **The cursor carries its query.** It embeds a fingerprint of the
 configuration's filters, its repositories and `for`. A cursor resumed under a
 different query is refused (exit 2), not silently resumed at a position that
-means something else. With 30 repositories, the configuration's cap, the
-cursor stays inside the runner's 4096-byte bound (pinned).
+means something else. With 20 repositories, the configuration's cap, and GitHub
+positions up to about 140 bytes each (real ones are about 60), the cursor
+stays inside the runner's 4096-byte bound (pinned with padded positions). A
+call whose cursor would not fit is refused, never answered with a cursor the
+runner would refuse.
 
 **Bounded work per call.** A call reads at most one GitHub page per repository
 plus 20 more, then answers with the eligible issues it has and a cursor. A long

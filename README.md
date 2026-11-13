@@ -50,7 +50,7 @@ key.
 
 | Key | Meaning |
 |---|---|
-| `repositories` | `"owner/name"`, 1 to 30. Their **open issues** are the intake (pull requests are not). |
+| `repositories` | `"owner/name"`, 1 to 20. Their **open issues** are the intake (pull requests are not). |
 | `readyLabel` | The label that marks an issue ready for intake. |
 | `ready` | `only` (list only ready issues; the default when `readyLabel` is set), `exclude`, or `any` (the default without one). |
 | `excludeLabels` | An issue carrying any of these is never listed. |
