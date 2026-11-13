@@ -112,7 +112,10 @@ The optional calls `report` and `changed-since` are not answered yet.
   claimed still resumes at the right place and skips nothing.
 - **The mark** is the `trackedLabel`, and optionally a comment. It never makes
   or decides a claim: the claim is the CLI's task create. A second mark of the
-  same issue (after a reassignment) is an ordinary call, never a refusal.
+  same issue (after a reassignment) is an ordinary call, never a refusal. Once
+  the label is on, the call succeeds: a comment that then fails is answered as
+  `"commented": false` with a `commentError`, not as a refusal, since the issue
+  is marked and no longer lists.
 - **Never partial.** A GitHub error, a rate limit, or an answer the adapter
   does not understand refuses the whole call; a list is never cut short and
   presented as whole. Labels past GitHub's first page of 100 are read too,

@@ -47,9 +47,10 @@ type markRequest struct {
 
 // markTracked puts the tracked label on the issue, and when the
 // configuration asks for it, a comment naming the task and the worker. It
-// never refuses because the issue is already marked: the mark shows a claim,
-// it never makes or decides one (cor:agt:120, D14). A re-mark after a
-// reassignment is an ordinary call.
+// never refuses once the label is on: a failed comment is reported as
+// commented:false with a commentError. It never refuses because the issue
+// is already marked: the mark shows a claim, it never makes or decides one
+// (cor:agt:120, D14). A re-mark after a reassignment is an ordinary call.
 func (s *session) markTracked(ctx context.Context, req json.RawMessage) (any, error) {
 	var r markRequest
 	if err := decode(req, "mark-tracked", &r); err != nil {
@@ -66,16 +67,20 @@ func (s *session) markTracked(ctx context.Context, req json.RawMessage) (any, er
 	if _, err := s.gh.rest(ctx, http.MethodPost, issuePath(ref, "/labels"), body, nil, http.StatusOK); err != nil {
 		return nil, fmt.Errorf("labelling %s/%s#%d: %w", ref.Owner, ref.Name, ref.Number, err)
 	}
-	commented := false
+	ans := map[string]any{"marked": true, "externalId": r.ExternalID, "label": s.cfg.TrackedLabel, "commented": false}
 	if s.cfg.Comment {
 		if _, err := s.gh.rest(ctx, http.MethodPost, issuePath(ref, "/comments"), map[string]string{"body": markComment(r)}, nil, http.StatusCreated); err != nil {
-			// The label is on: the item shows as tracked. Say the comment
-			// failed rather than pretend the whole mark did.
-			return nil, fmt.Errorf("%s/%s#%d is labelled %q, but the comment failed: %w", ref.Owner, ref.Name, ref.Number, s.cfg.TrackedLabel, err)
+			// The label is the mark, and it is on: the issue no longer
+			// lists. Refusing now would tell the runner the mark failed
+			// while the issue is in fact marked, stranding it outside
+			// intake. The comment is decoration, so its failure is
+			// reported in a successful answer, scrubbed like a refusal.
+			ans["commentError"] = s.gh.scrub(err.Error())
+			return ans, nil
 		}
-		commented = true
+		ans["commented"] = true
 	}
-	return map[string]any{"marked": true, "externalId": r.ExternalID, "label": s.cfg.TrackedLabel, "commented": commented}, nil
+	return ans, nil
 }
 
 // code quotes text from Hadron as inline code on one line, so a name cannot

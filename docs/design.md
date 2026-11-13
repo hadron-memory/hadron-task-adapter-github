@@ -32,7 +32,10 @@ filters on. A comment naming the task and worker is opt-in (`comment: true`)
 because on a public repository it publishes the team's worker names and links.
 Hadron text in a comment is quoted as inline code on one line, so a name cannot
 mention, link or reflow. The portal URL is linked only as the server printed
-it, and only a plain https URL.
+it, and only a plain https URL. Because the label alone is the mark, a comment
+that fails after the label landed does not refuse the call: the answer says
+`"commented": false` and carries the scrubbed `commentError`. Refusing would
+tell the runner the mark failed while the issue is marked and no longer lists.
 
 **Filtering happens in the adapter, after GitHub's paging.** The GitHub list
 is all open issues in creation order. The tracked label, the excluded labels,
