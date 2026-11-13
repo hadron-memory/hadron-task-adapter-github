@@ -114,8 +114,11 @@ func (e *env) ok(name string, req map[string]any, out any) {
 
 func (e *env) noToken(r result) {
 	e.t.Helper()
-	if bytes.Contains(r.stdout, []byte(token)) || bytes.Contains(r.stderr, []byte(token)) {
-		e.t.Fatalf("the GitHub credential was printed:\nstdout %s\nstderr %s", r.stdout, r.stderr)
+	// A fragment counts: a message cut short before it was scrubbed would
+	// print the credential's first characters (LOCAL delta at c6b55d29).
+	frag := []byte(token[:12])
+	if bytes.Contains(r.stdout, frag) || bytes.Contains(r.stderr, frag) {
+		e.t.Fatalf("the GitHub credential (or a fragment of it) was printed:\nstdout %s\nstderr %s", r.stdout, r.stderr)
 	}
 }
 
@@ -563,6 +566,28 @@ func TestARefusedIssueURLDoesNotEchoTheCredential(t *testing.T) {
 		t.Fatalf("a malformed issue URL was listed: %s", r.stdout)
 	}
 	e.noToken(r)
+}
+
+// Untrusted text is cut to a bounded length in a refusal. The credential is
+// scrubbed before the cut, so a cut that lands inside it leaks no prefix.
+func TestACredentialCutShortInARefusalLeaksNoFragment(t *testing.T) {
+	for pad := 40; pad <= 120; pad += 4 {
+		e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
+		e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 1, Title: "a", CreatedAt: day(1)})
+		e.gh.SuffixURLs("?pad=" + strings.Repeat("x", pad) + "&echo=" + token)
+		r := e.call("list-untracked", map[string]any{"limit": 20})
+		if r.code == 0 {
+			t.Fatalf("pad %d: a malformed issue URL was listed: %s", pad, r.stdout)
+		}
+		e.noToken(r)
+		// The same for an id the runner hands back.
+		bad := "https://github.com/acme/app/pull/1?pad=" + strings.Repeat("x", pad) + "&echo=" + token
+		r = e.call("get", map[string]any{"externalId": bad})
+		if r.code == 0 {
+			t.Fatalf("pad %d: a pull URL was read as an issue: %s", pad, r.stdout)
+		}
+		e.noToken(r)
+	}
 }
 
 // A request with anything after its one object is refused before any write.
