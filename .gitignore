@@ -1,0 +1,8 @@
+# A team's own adapter configuration (repositories, labels, team map) and any
+# credential stay out of this public repository. Only config.example.json is
+# committed.
+/config.json
+*.local.json
+.env
+/bin/
+/dist/
