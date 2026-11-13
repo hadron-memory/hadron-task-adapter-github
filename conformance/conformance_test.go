@@ -304,6 +304,28 @@ func TestMarkCommentIsOptInAndCarriesTheServersURL(t *testing.T) {
 	}
 }
 
+// The label is the mark; the comment is decoration. A comment that fails
+// after the label landed must not turn the call into a refusal: the runner
+// would read the issue as unmarked while it no longer lists.
+func TestMarkCommentFailureAfterTheLabelStillAnswersMarked(t *testing.T) {
+	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}, "comment": true})
+	e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 4, Title: "x", CreatedAt: day(1)})
+	e.gh.FailComments(403)
+	e.gh.EchoInErrors(token)
+	var ans map[string]any
+	e.ok("mark-tracked", map[string]any{"externalId": e.gh.IssueURL("acme/app", 4),
+		"task": map[string]any{"id": "01abc"}, "worker": map[string]any{"name": "W"}}, &ans)
+	if ans["marked"] != true || ans["commented"] != false {
+		t.Fatalf("answer after a failed comment: %v", ans)
+	}
+	if msg, _ := ans["commentError"].(string); msg == "" || strings.Contains(msg, token) {
+		t.Fatalf("commentError missing or unscrubbed: %v", ans)
+	}
+	if l := e.gh.Labels("acme/app", 4); strings.Join(l, ",") != "hadron-tracked" {
+		t.Fatalf("labels after mark: %v", l)
+	}
+}
+
 func TestGetAndNormalize(t *testing.T) {
 	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
 	e.gh.AddRepo("Acme/App", fakegithub.Issue{Number: 12, Title: "the title", Body: "the body", CreatedAt: day(1), Labels: []string{"hadron-tracked"}})

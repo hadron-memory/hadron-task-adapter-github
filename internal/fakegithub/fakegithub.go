@@ -56,8 +56,11 @@ type Server struct {
 	cursorPad int
 	// urlSuffix is appended to every issue URL in a list (a misbehaving proxy).
 	urlSuffix string
-	Comments  []Comment
-	Requests  []string // "METHOD path" or "GRAPHQL op", in order
+	// commentFail, when set, answers every comment POST with this status
+	// (the label POST before it still succeeds).
+	commentFail int
+	Comments    []Comment
+	Requests    []string // "METHOD path" or "GRAPHQL op", in order
 }
 
 // New starts a fake GitHub that accepts token.
@@ -95,6 +98,13 @@ func (s *Server) Fail(full string, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fail[strings.ToLower(full)] = status
+}
+
+// FailComments makes every comment POST answer with status.
+func (s *Server) FailComments(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commentFail = status
 }
 
 // EchoInErrors makes error bodies include text, as a misbehaving proxy might.
@@ -274,6 +284,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		is.Labels = kept
 		writeJSON(w, 200, labelObjs(is.Labels))
 	case parts[5] == "comments" && len(parts) == 6 && r.Method == http.MethodPost:
+		if s.commentFail != 0 {
+			s.writeErr(w, s.commentFail, "comment refused")
+			return
+		}
 		var body struct {
 			Body string `json:"body"`
 		}
