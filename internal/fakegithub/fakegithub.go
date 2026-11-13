@@ -45,17 +45,19 @@ type Server struct {
 	mu sync.Mutex
 	// repos is keyed by the lower-cased "owner/name"; canon keeps GitHub's
 	// own spelling, which is what an issue URL carries.
-	repos    map[string][]*Issue
-	canon    map[string]string
-	fail     map[string]int // lower-cased "owner/name" -> HTTP status for any read of it
-	echo     string         // when set, error bodies carry this text (to test redaction)
-	Comments []Comment
-	Requests []string // "METHOD path" or "GRAPHQL op", in order
+	repos map[string][]*Issue
+	canon map[string]string
+	fail  map[string]int // lower-cased "owner/name" -> HTTP status for any read of it
+	// repoLabels are the labels defined in a repository (not on an issue).
+	repoLabels map[string][]string
+	echo       string // when set, error bodies carry this text (to test redaction)
+	Comments   []Comment
+	Requests   []string // "METHOD path" or "GRAPHQL op", in order
 }
 
 // New starts a fake GitHub that accepts token.
 func New(token string) *Server {
-	s := &Server{Token: token, repos: map[string][]*Issue{}, canon: map[string]string{}, fail: map[string]int{}}
+	s := &Server{Token: token, repos: map[string][]*Issue{}, canon: map[string]string{}, fail: map[string]int{}, repoLabels: map[string][]string{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	return s
 }
@@ -73,6 +75,14 @@ func (s *Server) AddRepo(full string, issues ...Issue) {
 		}
 		s.repos[k] = append(s.repos[k], &is)
 	}
+}
+
+// DefineLabel creates a label in a repository's label list.
+func (s *Server) DefineLabel(full, label string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := strings.ToLower(full)
+	s.repoLabels[k] = append(s.repoLabels[k], label)
 }
 
 // Fail makes every read of a repository answer with status.
@@ -108,8 +118,8 @@ func (s *Server) SetLabels(full string, number int, labels ...string) {
 	}
 }
 
-// URL is the canonical issue URL GitHub would print.
-func (s *Server) URL(full string, number int) string {
+// IssueURL is the canonical issue URL GitHub would print.
+func (s *Server) IssueURL(full string, number int) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return fmt.Sprintf("https://github.com/%s/issues/%d", s.canon[strings.ToLower(full)], number)
@@ -176,6 +186,16 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(parts) == 3 && r.Method == http.MethodGet {
 		writeJSON(w, 200, map[string]any{"full_name": s.canon[k]})
+		return
+	}
+	if len(parts) == 5 && parts[3] == "labels" && r.Method == http.MethodGet {
+		for _, l := range s.repoLabels[k] {
+			if strings.EqualFold(l, parts[4]) {
+				writeJSON(w, 200, map[string]string{"name": l})
+				return
+			}
+		}
+		s.writeErr(w, 404, "Not Found")
 		return
 	}
 	if len(parts) < 6 || parts[3] != "issues" {

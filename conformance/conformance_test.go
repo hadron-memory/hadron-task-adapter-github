@@ -56,7 +56,10 @@ func newEnv(t *testing.T, cfg map[string]any) *env {
 	gh := fakegithub.New(token)
 	t.Cleanup(gh.Close)
 	cfg["apiUrl"] = gh.URL
-	b, _ := json.Marshal(cfg)
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
 	p := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(p, b, 0o600); err != nil {
 		t.Fatal(err)
@@ -214,14 +217,14 @@ func TestWalkListsEveryEligibleIssueOnceOldestFirst(t *testing.T) {
 	for _, limit := range []int{1, 2, 100} {
 		got := ids(e.walk("", limit, nil))
 		want := []string{
-			e.gh.URL("acme/app", 1), e.gh.URL("Acme/Lib", 9), e.gh.URL("Acme/Lib", 7), e.gh.URL("acme/app", 6),
+			e.gh.IssueURL("acme/app", 1), e.gh.IssueURL("Acme/Lib", 9), e.gh.IssueURL("Acme/Lib", 7), e.gh.IssueURL("acme/app", 6),
 		}
 		if strings.Join(got, " ") != strings.Join(want, " ") {
 			t.Fatalf("limit %d:\n got %v\nwant %v", limit, got, want)
 		}
 	}
 	// The external id is GitHub's own canonical URL, in GitHub's spelling.
-	if got := e.gh.URL("Acme/Lib", 9); got != "https://github.com/Acme/Lib/issues/9" {
+	if got := e.gh.IssueURL("Acme/Lib", 9); got != "https://github.com/Acme/Lib/issues/9" {
 		t.Fatalf("fixture: %s", got)
 	}
 }
@@ -252,7 +255,7 @@ func TestMarksBetweenPagesSkipNothing(t *testing.T) {
 func TestMarkThenUntrackRoundTrip(t *testing.T) {
 	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}, "trackedLabel": "in-hadron"})
 	e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 4, Title: "x", CreatedAt: day(1), Labels: []string{"bug"}})
-	id := e.gh.URL("acme/app", 4)
+	id := e.gh.IssueURL("acme/app", 4)
 	var ans map[string]any
 	e.ok("mark-tracked", map[string]any{"externalId": id,
 		"task":   map[string]any{"id": "01abc", "handle": "AT1.2", "portalUrl": "https://hadronmemory.com/app/u/x"},
@@ -284,7 +287,7 @@ func TestMarkCommentIsOptInAndCarriesTheServersURL(t *testing.T) {
 	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}, "comment": true})
 	e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 4, Title: "x", CreatedAt: day(1)})
 	var ans map[string]any
-	e.ok("mark-tracked", map[string]any{"externalId": e.gh.URL("acme/app", 4),
+	e.ok("mark-tracked", map[string]any{"externalId": e.gh.IssueURL("acme/app", 4),
 		"task":   map[string]any{"id": "01abc", "handle": "AT1.2", "portalUrl": "https://hadronmemory.com/app/u/hrn:agenttask:x"},
 		"worker": map[string]any{"name": "Jonas\n@everyone", "role": "cli-engineer"}}, &ans)
 	if len(e.gh.Comments) != 1 {
@@ -304,7 +307,7 @@ func TestMarkCommentIsOptInAndCarriesTheServersURL(t *testing.T) {
 func TestGetAndNormalize(t *testing.T) {
 	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
 	e.gh.AddRepo("Acme/App", fakegithub.Issue{Number: 12, Title: "the title", Body: "the body", CreatedAt: day(1), Labels: []string{"hadron-tracked"}})
-	id := e.gh.URL("acme/app", 12)
+	id := e.gh.IssueURL("acme/app", 12)
 	var got struct {
 		Item struct {
 			ExternalID, Title, Body, State, URL string
@@ -339,12 +342,12 @@ func TestForSelectsTheMappedTeam(t *testing.T) {
 		fakegithub.Issue{Number: 3, Title: "none", CreatedAt: day(3), Labels: []string{"bug"}},
 	)
 	cases := map[string][]string{
-		"Ada":                             {e.gh.URL("acme/app", 1)},
-		"ada":                             {e.gh.URL("acme/app", 1)},
-		"hrn:worker:example.com:team:ada": {e.gh.URL("acme/app", 1)},
-		"Xan":                             {e.gh.URL("acme/app", 2)},
-		"Bo":                              {e.gh.URL("acme/app", 3)},
-		"":                                {e.gh.URL("acme/app", 1), e.gh.URL("acme/app", 2), e.gh.URL("acme/app", 3)},
+		"Ada":                             {e.gh.IssueURL("acme/app", 1)},
+		"ada":                             {e.gh.IssueURL("acme/app", 1)},
+		"hrn:worker:example.com:team:ada": {e.gh.IssueURL("acme/app", 1)},
+		"Xan":                             {e.gh.IssueURL("acme/app", 2)},
+		"Bo":                              {e.gh.IssueURL("acme/app", 3)},
+		"":                                {e.gh.IssueURL("acme/app", 1), e.gh.IssueURL("acme/app", 2), e.gh.IssueURL("acme/app", 3)},
 	}
 	for who, want := range cases {
 		if got := ids(e.walk(who, 20, nil)); strings.Join(got, " ") != strings.Join(want, " ") {
@@ -368,7 +371,7 @@ func TestLabelsPastOnePageDecideTheFilters(t *testing.T) {
 		fakegithub.Issue{Number: 1, Title: "excluded late", CreatedAt: day(1), Labels: append(append([]string{}, many...), "wontfix")},
 		fakegithub.Issue{Number: 2, Title: "fine", CreatedAt: day(2), Labels: many},
 	)
-	if got := ids(e.walk("", 20, nil)); len(got) != 1 || got[0] != e.gh.URL("acme/app", 2) {
+	if got := ids(e.walk("", 20, nil)); len(got) != 1 || got[0] != e.gh.IssueURL("acme/app", 2) {
 		t.Fatalf("got %v", got)
 	}
 }
@@ -413,6 +416,14 @@ func TestCredentialIsTheTeamsNeverHadrons(t *testing.T) {
 
 func TestRequestDisciplineIsRefused(t *testing.T) {
 	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
+	// Every repository and issue the cases name exists and is readable, so
+	// each refusal is the adapter's own, not GitHub's.
+	e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 1, Title: "a", CreatedAt: day(1)})
+	e.gh.AddRepo("other/repo", fakegithub.Issue{Number: 1, Title: "b", CreatedAt: day(1)})
+	var sane Page
+	e.ok("list-untracked", map[string]any{"limit": 20}, &sane)
+	var got map[string]any
+	e.ok("get", map[string]any{"externalId": e.gh.IssueURL("acme/app", 1)}, &got)
 	cases := map[string]struct {
 		args  []string
 		stdin string
@@ -490,9 +501,9 @@ func TestCursorFitsTheRunnersBoundAtMaxRepositories(t *testing.T) {
 }
 
 func TestCheckReports(t *testing.T) {
-	e := newEnv(t, map[string]any{"repositories": []string{"acme/app", "acme/gone"}})
+	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
 	e.gh.AddRepo("acme/app")
-	var c struct {
+	type report struct {
 		OK     bool
 		Checks []struct {
 			Name   string
@@ -500,7 +511,22 @@ func TestCheckReports(t *testing.T) {
 			Detail string
 		}
 	}
+	var c report
 	e.ok("check", nil, &c)
+	if c.OK {
+		t.Fatalf("check passed with the tracked label not defined in the repository: %+v", c)
+	}
+	e.gh.DefineLabel("acme/app", "Hadron-Tracked")
+	c = report{}
+	e.ok("check", nil, &c)
+	if !c.OK {
+		t.Fatalf("check failed on a sound setup: %+v", c)
+	}
+	e2 := newEnv(t, map[string]any{"repositories": []string{"acme/app", "acme/gone"}})
+	e2.gh.AddRepo("acme/app")
+	e2.gh.DefineLabel("acme/app", "hadron-tracked")
+	c = report{}
+	e2.ok("check", nil, &c)
 	if c.OK {
 		t.Fatalf("check passed with an unreadable repository: %+v", c)
 	}

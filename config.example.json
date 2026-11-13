@@ -1,0 +1,12 @@
+{
+  "repositories": ["your-org/your-repo", "your-org/another-repo"],
+  "readyLabel": "ready",
+  "ready": "only",
+  "excludeLabels": ["epic", "wontfix"],
+  "teams": [
+    { "for": ["WorkerName", "hrn:worker:example.com:your-team-app:workername"], "label": "team-a" },
+    { "for": ["AnotherWorker"], "noTeam": true }
+  ],
+  "trackedLabel": "hadron-tracked",
+  "comment": false
+}
