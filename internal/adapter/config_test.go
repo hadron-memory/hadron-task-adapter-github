@@ -189,6 +189,10 @@ func TestClipRedactsAnyFragmentOfTheCredential(t *testing.T) {
 			t.Fatalf("cut at %d leaked: %q", max, got)
 		}
 	}
+	// The whole credential is replaced exactly, leaving none of it behind.
+	if got := g.clip("a "+tok+" b", 200); got != "a [redacted] b" {
+		t.Fatalf("whole credential: %q", got)
+	}
 	if got := g.clip("plain text, no credential", 200); got != "plain text, no credential" {
 		t.Fatalf("clean text changed: %q", got)
 	}

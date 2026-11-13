@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 )
 
@@ -89,11 +88,7 @@ func Run(ctx context.Context, e Env) int {
 	}
 	// Every refusal is scrubbed of the credential, whatever its source:
 	// GitHub's error text, or data GitHub returned that the adapter refuses.
-	msg := err.Error()
-	if token != "" {
-		msg = strings.ReplaceAll(msg, token, "[redacted]")
-	}
-	fmt.Fprintf(e.Stderr, "%s: %s\n", Name, oneLine(msg, 600))
+	fmt.Fprintf(e.Stderr, "%s: %s\n", Name, oneLine(redact(err.Error(), token), 600))
 	return code
 }
 

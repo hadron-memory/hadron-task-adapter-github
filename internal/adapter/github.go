@@ -53,10 +53,31 @@ func (g *githubClient) scrub(s string) string {
 // credential scrubbed FIRST: a cut that lands inside the credential would
 // otherwise leave a prefix that no later scrub can recognise.
 func (g *githubClient) clip(s string, max int) string {
-	if g.token != "" {
-		s = strings.ReplaceAll(s, g.token, "[redacted]")
+	return oneLine(redact(s, g.token), max)
+}
+
+// minFragment is the shortest prefix of the credential redacted wherever
+// it appears; a shorter one is redacted only where a cut left it.
+const minFragment = 8
+
+// redact removes the credential from s: whole, as any prefix of at least
+// minFragment runes, and as any prefix at all right before the ellipsis a
+// cut leaves. Text can arrive already cut (a proxy echoing a truncated
+// token), and a cut can land inside the credential.
+func redact(s, token string) string {
+	if token == "" {
+		return s
 	}
-	return oneLine(s, max)
+	s = strings.ReplaceAll(s, token, "[redacted]")
+	for k := len(token) - 1; k >= 1; k-- {
+		p := token[:k]
+		if k >= minFragment {
+			s = strings.ReplaceAll(s, p, "[redacted]")
+		} else {
+			s = strings.ReplaceAll(s, p+"…", "[redacted]…")
+		}
+	}
+	return s
 }
 
 func (g *githubClient) do(ctx context.Context, method, endpoint string, body any) (int, []byte, error) {
