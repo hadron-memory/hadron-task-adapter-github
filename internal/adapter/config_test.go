@@ -17,6 +17,9 @@ func TestConfigRefusals(t *testing.T) {
 		"duplicate repo":            `{"repositories":["acme/app","ACME/App"]}`,
 		"unknown key":               `{"repositories":["acme/app"],"readyLable":"x"}`,
 		"two values":                `{"repositories":["acme/app"]}{}`,
+		"trailing bracket":          `{"repositories":["acme/app"]}]`,
+		"trailing brace":            `{"repositories":["acme/app"]}}`,
+		"twenty-one repositories":   `{"repositories":[` + manyRepos(21) + `]}`,
 		"ready only without label":  `{"repositories":["acme/app"],"ready":"only"}`,
 		"ready unknown":             `{"repositories":["acme/app"],"readyLabel":"r","ready":"some"}`,
 		"control in label":          "{\"repositories\":[\"acme/app\"],\"readyLabel\":\"a\\u0007b\"}",
@@ -31,7 +34,6 @@ func TestConfigRefusals(t *testing.T) {
 		"plain http to remote":      `{"repositories":["acme/app"],"apiUrl":"http://api.example.com"}`,
 		"userinfo in api url":       `{"repositories":["acme/app"],"apiUrl":"https://u:p@api.example.com"}`,
 		"web host with scheme":      `{"repositories":["acme/app"],"webHost":"https://github.com"}`,
-		"thirty-one repositories":   `{"repositories":[` + manyRepos(31) + `]}`,
 		"graphql url to plain http": `{"repositories":["acme/app"],"graphqlUrl":"http://example.com/graphql"}`,
 	}
 	for name, raw := range cases {

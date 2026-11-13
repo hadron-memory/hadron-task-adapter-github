@@ -474,13 +474,15 @@ func TestCursorIsBoundToItsQuery(t *testing.T) {
 }
 
 // The cursor stays inside the runner's bound with the most repositories the
-// configuration allows, every one of them part-way through.
+// configuration allows, every one of them part-way through, with GitHub
+// positions longer than any seen (their length is not promised).
 func TestCursorFitsTheRunnersBoundAtMaxRepositories(t *testing.T) {
 	repos := []string{}
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 20; i++ {
 		repos = append(repos, fmt.Sprintf("a-rather-long-organisation-name/a-rather-long-repository-name-%02d", i))
 	}
 	e := newEnv(t, map[string]any{"repositories": repos})
+	e.gh.PadCursors(129)
 	for i, r := range repos {
 		e.gh.AddRepo(r,
 			fakegithub.Issue{Number: 100000 + i, Title: "t", CreatedAt: day(1).Add(time.Duration(i) * time.Minute)},
@@ -488,15 +490,72 @@ func TestCursorFitsTheRunnersBoundAtMaxRepositories(t *testing.T) {
 		)
 	}
 	var p Page
-	e.ok("list-untracked", map[string]any{"limit": 30}, &p)
-	if p.NextCursor == nil || len(p.Items) != 30 {
+	e.ok("list-untracked", map[string]any{"limit": 20}, &p)
+	if p.NextCursor == nil || len(p.Items) != 20 {
 		t.Fatalf("items %d cursor %v", len(p.Items), p.NextCursor)
 	}
 	if err := CheckPage(p); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(e.walk("", 100, nil)); got != 60 {
-		t.Fatalf("walk: %d of 60", got)
+	if got := len(e.walk("", 100, nil)); got != 40 {
+		t.Fatalf("walk: %d of 40", got)
+	}
+}
+
+// Positions too long to fit refuse the call: a page is never answered with
+// a cursor the runner would refuse.
+func TestACursorThatCannotFitIsARefusalNotAnAnswer(t *testing.T) {
+	repos := []string{}
+	for i := 0; i < 20; i++ {
+		repos = append(repos, fmt.Sprintf("acme/r%02d", i))
+	}
+	e := newEnv(t, map[string]any{"repositories": repos})
+	e.gh.PadCursors(400)
+	for i, r := range repos {
+		e.gh.AddRepo(r,
+			fakegithub.Issue{Number: 1, Title: "t", CreatedAt: day(1).Add(time.Duration(i) * time.Minute)},
+			fakegithub.Issue{Number: 2, Title: "t", CreatedAt: day(20)},
+		)
+	}
+	r := e.call("list-untracked", map[string]any{"limit": 20})
+	if r.code == 0 {
+		var p Page
+		if err := OneObject(r.stdout, &p); err == nil && CheckPage(p) == nil {
+			return // fitted after all: fine
+		}
+		t.Fatalf("answered with a cursor the runner refuses: %d bytes", len(r.stdout))
+	}
+	if len(bytes.TrimSpace(r.stdout)) != 0 {
+		t.Fatalf("a refusal wrote stdout")
+	}
+}
+
+// Text GitHub returns is never repeated with the credential in it: not
+// only GitHub's error messages, but data the adapter refuses.
+func TestARefusedIssueURLDoesNotEchoTheCredential(t *testing.T) {
+	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
+	e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 1, Title: "a", CreatedAt: day(1)})
+	e.gh.SuffixURLs("?echo=" + token)
+	r := e.call("list-untracked", map[string]any{"limit": 20})
+	if r.code == 0 {
+		t.Fatalf("a malformed issue URL was listed: %s", r.stdout)
+	}
+	e.noToken(r)
+}
+
+// A request with anything after its one object is refused before any write.
+func TestTrailingTextAfterTheRequestIsRefusedBeforeAnyWrite(t *testing.T) {
+	e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
+	e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 4, Title: "x", CreatedAt: day(1)})
+	req := `{"contractVersion":1,"externalId":"` + e.gh.IssueURL("acme/app", 4) + `","task":{"id":"t"},"worker":{}}`
+	for _, suffix := range []string{"]", "}", " x", "{}", "null"} {
+		r := e.raw([]string{"mark-tracked"}, []byte(req+suffix))
+		if r.code == 0 {
+			t.Fatalf("suffix %q accepted: %s", suffix, r.stdout)
+		}
+		if l := e.gh.Labels("acme/app", 4); len(l) != 0 {
+			t.Fatalf("suffix %q: the mark was written before the refusal: %v", suffix, l)
+		}
 	}
 }
 

@@ -51,8 +51,13 @@ type Server struct {
 	// repoLabels are the labels defined in a repository (not on an issue).
 	repoLabels map[string][]string
 	echo       string // when set, error bodies carry this text (to test redaction)
-	Comments   []Comment
-	Requests   []string // "METHOD path" or "GRAPHQL op", in order
+	// cursorPad lengthens every issue cursor to at least this many bytes
+	// (GitHub's cursors are opaque and their length is not promised).
+	cursorPad int
+	// urlSuffix is appended to every issue URL in a list (a misbehaving proxy).
+	urlSuffix string
+	Comments  []Comment
+	Requests  []string // "METHOD path" or "GRAPHQL op", in order
 }
 
 // New starts a fake GitHub that accepts token.
@@ -97,6 +102,20 @@ func (s *Server) EchoInErrors(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.echo = text
+}
+
+// PadCursors makes every issue cursor at least n bytes long.
+func (s *Server) PadCursors(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cursorPad = n
+}
+
+// SuffixURLs appends text to every issue URL a list returns.
+func (s *Server) SuffixURLs(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.urlSuffix = text
 }
 
 // Labels returns an issue's current labels.
@@ -287,6 +306,17 @@ func labelObjs(ls []string) []map[string]string {
 	return out
 }
 
+func (s *Server) cursor(number int) string {
+	raw := "cursor:v2:" + strconv.Itoa(number)
+	if s.cursorPad > 0 {
+		raw += "|"
+		for len(base64.StdEncoding.EncodeToString([]byte(raw))) < s.cursorPad {
+			raw += "x"
+		}
+	}
+	return base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
 type gqlReq struct {
 	Query         string         `json:"query"`
 	OperationName string         `json:"operationName"`
@@ -351,7 +381,8 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		start := 0
 		if after := str(q.Variables["after"]); after != "" {
 			raw, err := base64.StdEncoding.DecodeString(after)
-			n, err2 := strconv.Atoi(strings.TrimPrefix(string(raw), "cursor:v2:"))
+			pos, _, _ := strings.Cut(strings.TrimPrefix(string(raw), "cursor:v2:"), "|")
+			n, err2 := strconv.Atoi(pos)
 			if err != nil || err2 != nil {
 				writeJSON(w, 200, map[string]any{"errors": []map[string]string{{"message": "`" + after + "` does not appear to be a valid cursor."}}})
 				return
@@ -372,10 +403,10 @@ func (s *Server) graphql(w http.ResponseWriter, r *http.Request) {
 		for i := start; i < len(open) && len(edges) < first; i++ {
 			is := open[i]
 			edges = append(edges, map[string]any{
-				"cursor": base64.StdEncoding.EncodeToString([]byte("cursor:v2:" + strconv.Itoa(is.Number))),
+				"cursor": s.cursor(is.Number),
 				"node": map[string]any{
 					"number": is.Number, "title": is.Title,
-					"url":       fmt.Sprintf("https://github.com/%s/issues/%d", full, is.Number),
+					"url":       fmt.Sprintf("https://github.com/%s/issues/%d", full, is.Number) + s.urlSuffix,
 					"createdAt": is.CreatedAt.UTC().Format(time.RFC3339),
 					"labels":    labelConn(is.Labels, labelsFirst),
 				},
