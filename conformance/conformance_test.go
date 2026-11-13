@@ -115,8 +115,9 @@ func (e *env) ok(name string, req map[string]any, out any) {
 func (e *env) noToken(r result) {
 	e.t.Helper()
 	// A fragment counts: a message cut short before it was scrubbed would
-	// print the credential's first characters (LOCAL delta at c6b55d29).
-	frag := []byte(token[:12])
+	// print the credential's first characters (LOCAL delta at c6b55d29). Eight
+	// runes is the fragment the adapter redacts anywhere.
+	frag := []byte(token[:8])
 	if bytes.Contains(r.stdout, frag) || bytes.Contains(r.stderr, frag) {
 		e.t.Fatalf("the GitHub credential (or a fragment of it) was printed:\nstdout %s\nstderr %s", r.stdout, r.stderr)
 	}
@@ -571,7 +572,8 @@ func TestARefusedIssueURLDoesNotEchoTheCredential(t *testing.T) {
 // Untrusted text is cut to a bounded length in a refusal. The credential is
 // scrubbed before the cut, so a cut that lands inside it leaks no prefix.
 func TestACredentialCutShortInARefusalLeaksNoFragment(t *testing.T) {
-	for pad := 40; pad <= 120; pad += 4 {
+	// Every pad from 0 to 130 puts the cut at every offset inside the token.
+	for pad := 0; pad <= 130; pad++ {
 		e := newEnv(t, map[string]any{"repositories": []string{"acme/app"}})
 		e.gh.AddRepo("acme/app", fakegithub.Issue{Number: 1, Title: "a", CreatedAt: day(1)})
 		e.gh.SuffixURLs("?pad=" + strings.Repeat("x", pad) + "&echo=" + token)

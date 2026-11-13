@@ -164,3 +164,32 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Fatalf("config.example.json: %v", err)
 	}
 }
+
+// A fragment of the credential is redacted wherever a cut can leave one:
+// text that arrives already truncated (a proxy echoing a cut token), and a
+// cut of ours that lands inside it (Ada's ruling on the LOCAL delta F3).
+func TestClipRedactsAnyFragmentOfTheCredential(t *testing.T) {
+	const tok = "ghp_FAKEunitTOKEN000000000000000000000000"
+	g := &githubClient{token: tok}
+	// Text that arrives already cut: any prefix right before the ellipsis,
+	// and any prefix of 8 runes or more anywhere.
+	for k := 1; k < len(tok); k++ {
+		for _, tail := range []string{"…", " and more"} {
+			in := "bad URL https://github.com/a/b/issues/1?echo=" + tok[:k] + tail
+			got := g.clip(in, 200)
+			if strings.Contains(got, tok[:k]+"…") || (k >= 8 && strings.Contains(got, tok[:k])) {
+				t.Fatalf("prefix %d (tail %q) survived: %q", k, tail, got)
+			}
+		}
+	}
+	// A cut of ours, at every length.
+	for max := 1; max < 120; max++ {
+		got := g.clip(strings.Repeat("x", 40)+tok+" tail", max)
+		if strings.Contains(got, tok[:8]) || strings.Contains(got, "g…") {
+			t.Fatalf("cut at %d leaked: %q", max, got)
+		}
+	}
+	if got := g.clip("plain text, no credential", 200); got != "plain text, no credential" {
+		t.Fatalf("clean text changed: %q", got)
+	}
+}
