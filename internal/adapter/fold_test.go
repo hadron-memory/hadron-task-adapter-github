@@ -1015,33 +1015,68 @@ func TestCheckSaysWhyWhen404OnRateLimitAndTheUserLookupFailsToo(t *testing.T) { 
 
 // ---- ids that hold no tracker item: a #fragment sub-claim, a pull request (AT0.9506) ----
 
-func TestAWriteCallForAnIdWithNoTrackerItemChangesNothingAndSucceeds(t *testing.T) {
+func mustNormalize(t *testing.T, c *Config) *Config {
+	t.Helper()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestAWriteCallForAnIdWithNoTrackerItemChangesNothingAndSucceedsWithTheEmptyAnswer(t *testing.T) {
 	f := newFake(t)
 	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
-	cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true, Report: map[string]ReportAction{"CANCELLED": {AddLabels: []string{"x"}}}}
-	_ = cfg.normalize()
-	a := newAdapter(t, f, cfg)
-	for idName, id := range map[string]string{
-		"a #fragment sub-claim": issueURL("acme/app", 1) + "#build",
-		"a pull request":        "https://github.com/acme/app/pull/7",
-		"a pull request#sub":    "https://github.com/acme/app/pull/7#build",
+	for cfgName, cfg := range map[string]*Config{
+		"a write-enabled config": mustNormalize(t, &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true, Report: map[string]ReportAction{"CANCELLED": {AddLabels: []string{"x"}}}}),
+		"a read-only config":     mustNormalize(t, &Config{Repositories: []string{"acme/app"}}),
 	} {
-		for name, req := range map[string]string{
-			"mark-tracked": markRequest(id),
-			"untrack":      `{"externalId":"` + id + `"}`,
-			"report":       `{"externalId":"` + id + `","state":"cancelled"}`,
+		a := newAdapter(t, f, cfg)
+		for idName, id := range map[string]string{
+			"a #fragment sub-claim":             issueURL("acme/app", 1) + "#build",
+			"a #fragment sub-claim, any case":   "https://github.com/ACME/App/issues/1#Build",
+			"a pull request":                    "https://github.com/acme/app/pull/7",
+			"a pull request with a fragment":    "https://github.com/acme/app/pull/7#build",
+			"a pull request that may not exist": "https://github.com/acme/app/pull/999999",
 		} {
-			if _, r := call(t, a, name, req); r != nil {
-				t.Errorf("%s of %s was refused: %v", name, idName, r)
+			for name, req := range map[string]string{
+				"mark-tracked": markRequest(id),
+				"untrack":      `{"externalId":"` + id + `"}`,
+				"report":       `{"externalId":"` + id + `","state":"cancelled"}`,
+			} {
+				m, r := call(t, a, name, req)
+				if r != nil {
+					t.Errorf("%s / %s of %s was refused: %v", cfgName, name, idName, r)
+				} else if len(m) != 0 {
+					t.Errorf("%s / %s of %s answered %v, want the empty object", cfgName, name, idName, m)
+				}
 			}
 		}
 	}
 	if len(f.Writes) != 0 || len(f.Requests) != 0 {
-		t.Fatalf("such an id must not touch the tracker at all: writes %v requests %v", f.Writes, f.Requests)
+		t.Fatalf("such an id must not touch the tracker at all (no write, no read): writes %v requests %v", f.Writes, f.Requests)
 	}
 }
 
-func TestAnIdThatIsNeitherAnIssueNorAKnownNoItemShapeIsStillRefused(t *testing.T) {
+// The guard comes after the request's own validation in mark-tracked (a bad
+// task or worker is a usage error whatever the id), and report keeps its
+// "an unknown state does nothing" answer.
+func TestTheNoTrackerItemGuardKeepsTheCallsOwnInputChecks(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	a := newAdapter(t, f, mustNormalize(t, &Config{Repositories: []string{"acme/app"}, TrackedLabel: "x"}))
+	id := issueURL("acme/app", 1) + "#build"
+	if _, r := call(t, a, "mark-tracked", `{"externalId":"`+id+`","task":{"id":""}}`); r == nil || r.Code != ExitUsage {
+		t.Errorf("a missing task id must be a usage error even for a sub-claim: %v", r)
+	}
+	if _, r := call(t, a, "mark-tracked", `{"externalId":"`+id+`","task":{"id":"t-1"},"worker":"not an object"}`); r == nil || r.Code != ExitUsage {
+		t.Errorf("a malformed worker must be a usage error even for a sub-claim: %v", r)
+	}
+	if _, r := call(t, a, "report", `{"externalId":"https://github.com/acme/app/pull/3","state":"no-such-state"}`); r != nil {
+		t.Errorf("an unknown state on a PR id does nothing, as for any id: %v", r)
+	}
+}
+
+func TestAnIdThatIsNotAListedIssueOrAKnownNoItemShapeIsStillRefusedByEveryWriteCall(t *testing.T) {
 	f := newFake(t)
 	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
 	a := newAdapter(t, f, baseConfig())
@@ -1049,25 +1084,66 @@ func TestAnIdThatIsNeitherAnIssueNorAKnownNoItemShapeIsStillRefused(t *testing.T
 		"a pull request in an unlisted repository": "https://github.com/acme/other/pull/1",
 		"a pull request on another host":           "https://example.com/acme/app/pull/1",
 		"a pull request number that is not one":    "https://github.com/acme/app/pull/x",
+		"pull/0":                                   "https://github.com/acme/app/pull/0",
+		"a leading-zero number":                    "https://github.com/acme/app/pull/07",
+		"a signed number":                          "https://github.com/acme/app/pull/+7",
+		"a trailing slash":                         "https://github.com/acme/app/pull/7/",
+		"a path below the pull request":            "https://github.com/acme/app/pull/7/files",
+		"a query":                                  "https://github.com/acme/app/pull/7?x=1",
+		"an empty fragment":                        "https://github.com/acme/app/pull/7#",
+		"two fragments":                            "https://github.com/acme/app/pull/7#a#b",
+		"an encoded path":                          "https://github.com/acme/app/pull/%37",
 		"a fragment on an unlisted repository":     issueURL("acme/other", 1) + "#build",
 		"a fragment on another host":               "https://example.com/acme/app/issues/1#build",
 		"a fragment holding a space":               issueURL("acme/app", 1) + "#a b",
 		"a path that is neither":                   "https://github.com/acme/app/discussions/1",
+		"an issue with a query":                    issueURL("acme/app", 1) + "?x=1",
+		"an issue with a trailing slash":           issueURL("acme/app", 1) + "/",
+		"an issue with an empty fragment":          issueURL("acme/app", 1) + "#",
+		"an issue with two fragments":              issueURL("acme/app", 1) + "#a#b",
 	} {
-		if _, r := call(t, a, "mark-tracked", markRequest(id)); r == nil {
-			t.Errorf("%s: accepted", name)
+		for call2, req := range map[string]string{
+			"mark-tracked": markRequest(id),
+			"untrack":      `{"externalId":"` + id + `"}`,
+			"report":       `{"externalId":"` + id + `","state":"cancelled"}`,
+		} {
+			if _, r := call(t, a, call2, req); r == nil {
+				t.Errorf("%s / %s: accepted", name, call2)
+			}
 		}
 	}
 }
 
-func TestABareIssueURLStillBehavesAsBefore(t *testing.T) {
+func TestABareIssueURLStillBehavesAsBeforeForEveryWriteCall(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
+	cfg := mustNormalize(t, &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Report: map[string]ReportAction{"CANCELLED": {AddLabels: []string{"cancelled"}}}})
+	a := newAdapter(t, f, cfg)
+	id := issueURL("acme/app", 1)
+	mustCall(t, a, "mark-tracked", markRequest(id))
+	n1 := len(f.Writes)
+	mustCall(t, a, "untrack", `{"externalId":"`+id+`"}`)
+	n2 := len(f.Writes)
+	mustCall(t, a, "report", `{"externalId":"`+id+`","state":"cancelled"}`)
+	if n1 == 0 || n2 <= n1 || len(f.Writes) <= n2 {
+		t.Fatalf("mark-tracked, untrack and report of a bare issue URL must each write: %v", f.Writes)
+	}
+}
+
+func TestAWriteCallAcceptsAHostCaseAndWwwAndLowercasesTheRepository(t *testing.T) {
 	f := newFake(t)
 	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
-	cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked"}
-	_ = cfg.normalize()
-	a := newAdapter(t, f, cfg)
-	mustCall(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
-	if len(f.Writes) == 0 {
-		t.Fatal("a bare issue URL must still be marked")
+	a := newAdapter(t, f, mustNormalize(t, &Config{Repositories: []string{"acme/app"}}))
+	for _, id := range []string{"https://www.github.com/ACME/App/pull/7", "https://GitHub.com/acme/app/pull/7"} {
+		if _, r := call(t, a, "untrack", `{"externalId":"`+id+`"}`); r != nil {
+			t.Errorf("%s: %v", id, r)
+		}
+	}
+	a.Host = "ghe.example.com"
+	if _, r := call(t, a, "untrack", `{"externalId":"https://ghe.example.com/acme/app/pull/7"}`); r != nil {
+		t.Errorf("a non-default host: %v", r)
+	}
+	if _, r := call(t, a, "untrack", `{"externalId":"https://github.com/acme/app/pull/7"}`); r == nil {
+		t.Error("the default host is not this adapter's host when Host is set")
 	}
 }
