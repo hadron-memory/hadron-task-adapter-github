@@ -177,11 +177,14 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any, out 
 	if len(raw) > maxBody {
 		return resp.StatusCode, &Refusal{Code: ExitRefused, Msg: "GitHub answer is larger than the adapter will read"}
 	}
-	if resp.StatusCode == http.StatusForbidden && resp.Header.Get("X-RateLimit-Remaining") == "0" {
+	// A rate limit is a 429, or a 403 that says so: the primary limit (remaining 0),
+	// a secondary limit (Retry-After) or a message naming one.
+	if resp.StatusCode == http.StatusTooManyRequests ||
+		(resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-RateLimit-Remaining") == "0" || resp.Header.Get("Retry-After") != "" || strings.Contains(strings.ToLower(string(raw)), "rate limit"))) {
 		return resp.StatusCode, &Refusal{Code: ExitRefused, Msg: "GitHub rate limit reached; retry after the limit resets"}
 	}
 	if resp.StatusCode >= 300 {
-		return resp.StatusCode, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered HTTP %d for %s %s", resp.StatusCode, method, c.scrubURL(endpoint))}
+		return resp.StatusCode, statusError{&Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered HTTP %d for %s %s", resp.StatusCode, method, c.scrubURL(endpoint))}, resp.StatusCode, string(raw)}
 	}
 	if out != nil {
 		if t := bytes.TrimSpace(raw); len(t) == 0 || string(t) == "null" { // a read needs its answer: nothing is not "empty"
@@ -412,9 +415,14 @@ func (c *Client) Login(ctx context.Context) (string, error) {
 	var r struct {
 		Login string `json:"login"`
 	}
-	code, err := c.do(ctx, http.MethodGet, c.API+"/user", nil, &r)
-	if code == http.StatusNotFound || (code == http.StatusForbidden && err != nil && !strings.Contains(err.Error(), "rate limit")) {
-		return "", ErrNoIdentity // an installation token names no account
+	_, err := c.do(ctx, http.MethodGet, c.API+"/user", nil, &r)
+	// Only GitHub's own statement that this credential has no account counts as
+	// "no account": a 404, or the 403 an installation token gets ("Resource not
+	// accessible by integration"). A rate limit, a plain 403, a 5xx or a
+	// transport failure is a failure to ask, never an answer.
+	var se statusError
+	if errors.As(err, &se) && (se.Status == http.StatusNotFound || (se.Status == http.StatusForbidden && strings.Contains(strings.ToLower(se.Body), "not accessible by integration"))) {
+		return "", ErrNoIdentity
 	}
 	if err != nil {
 		return "", err // a failure to ask is not "no account"
@@ -471,3 +479,13 @@ func (c *Client) Ping(ctx context.Context) (reachable, accepted bool, err error)
 	}
 	return true, false, fmt.Errorf("GitHub answered HTTP %d", resp.StatusCode)
 }
+
+// statusError is a refusal for a non-2xx answer that keeps the status and the
+// body, so a caller can tell what GitHub actually said.
+type statusError struct {
+	*Refusal
+	Status int
+	Body   string
+}
+
+func (e statusError) Unwrap() error { return e.Refusal }

@@ -728,19 +728,45 @@ func TestAnIdentityLookupThatFailsTouchesNothing(t *testing.T) {
 	}
 }
 
-func TestACredentialThatHasNoAccountTrustsTheConfiguredAuthor(t *testing.T) { // the documented installation case
-	for _, status := range []int{404, 403} {
-		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
-		a := &Adapter{Config: &Config{CommentAuthor: "my-app[bot]"}, Client: &Client{API: srv.URL, Token: token, HTTP: srv.Client()}}
-		if got, err := a.ownLogin(context.Background()); err != nil || got != "my-app[bot]" {
-			t.Errorf("HTTP %d: %q %v", status, got, err)
-		}
-		srv.Close()
+func TestOnlyGitHubSayingTheCredentialHasNoAccountTrustsTheConfiguredAuthor(t *testing.T) {
+	type resp struct {
+		status int
+		header map[string]string
+		body   string
 	}
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
-	defer srv.Close()
-	a := &Adapter{Config: &Config{CommentAuthor: "my-app[bot]"}, Client: &Client{API: srv.URL, Token: token, HTTP: srv.Client()}}
-	if _, err := a.ownLogin(context.Background()); err == nil {
-		t.Error("a refused credential (401) must not fall back to the configured author")
+	trust := map[string]resp{
+		"404":                {404, nil, `{"message":"Not Found"}`},
+		"403 not accessible": {403, nil, `{"message":"Resource not accessible by integration"}`},
+	}
+	refuse := map[string]resp{
+		"401":                      {401, nil, `{"message":"Bad credentials"}`},
+		"403 plain":                {403, nil, `{"message":"Forbidden"}`},
+		"403 empty":                {403, nil, ``},
+		"403 secondary rate limit": {403, map[string]string{"Retry-After": "60", "X-RateLimit-Remaining": "4000"}, `{"message":"You have exceeded a secondary rate limit"}`},
+		"403 limit named in text":  {403, nil, `{"message":"API rate limit exceeded"}`},
+		"429":                      {429, nil, ``},
+		"500":                      {500, nil, ``},
+	}
+	run := func(r resp) (string, error) {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			for k, v := range r.header {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(r.status)
+			_, _ = w.Write([]byte(r.body))
+		}))
+		defer srv.Close()
+		a := &Adapter{Config: &Config{CommentAuthor: "my-app[bot]"}, Client: &Client{API: srv.URL, Token: token, HTTP: srv.Client()}}
+		return a.ownLogin(context.Background())
+	}
+	for name, r := range trust {
+		if got, err := run(r); err != nil || got != "my-app[bot]" {
+			t.Errorf("%s: want the configured author, got %q %v", name, got, err)
+		}
+	}
+	for name, r := range refuse {
+		if got, err := run(r); err == nil {
+			t.Errorf("%s: trusted %q though GitHub did not say the credential has no account", name, got)
+		}
 	}
 }
