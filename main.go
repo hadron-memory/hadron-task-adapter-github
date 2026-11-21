@@ -28,7 +28,7 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 	if call != "describe" {
 		client, err := adapter.NewClient(getenv)
 		if err != nil {
-			return refuse(stderr, err)
+			return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 		}
 		a.Client = client
 		path, err := adapter.ConfigPath(getenv, os.UserHomeDir)
@@ -38,17 +38,17 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 		if err != nil {
 			a.Config = nil
 			if call != "check" { // check runs without a config, and says why it has none
-				return refuse(stderr, err)
+				return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 			}
 			a.ConfigError = err.Error()
 		}
 	}
 	out, err := a.Handle(context.Background(), call, stdin)
 	if err != nil {
-		return refuse(stderr, err)
+		return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 	}
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
-		return refuse(stderr, err)
+		return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 	}
 	return 0
 }
@@ -56,13 +56,15 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 // refuse prints err as ONE line (the CLI shows the first 4 KiB of stderr, and an
 // upstream message must not smuggle in line breaks or terminal controls) and
 // returns its exit code.
-func refuse(stderr *os.File, err error) int {
+func refuse(stderr *os.File, err error, token string) int {
 	code := adapter.ExitRefused
 	var r *adapter.Refusal
 	if errors.As(err, &r) {
 		code = r.Code
 	}
-	fmt.Fprintln(stderr, oneLine(err.Error(), 1000))
+	// A last scrub over everything printed: whatever built the message, the
+	// credential is not in it (raw, quoted or URL-escaped).
+	fmt.Fprintln(stderr, oneLine(adapter.ScrubSecret(err.Error(), token), 1000))
 	return code
 }
 

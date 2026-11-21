@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,7 +54,38 @@ func NewClient(getenv func(string) string) (*Client, error) {
 			return nil, &Refusal{Code: ExitRefused, Msg: name + " is not usable: " + err.Error()}
 		}
 	}
-	return &Client{API: api, GraphQL: gql, Token: getenv("GITHUB_TOKEN"), HTTP: &http.Client{Timeout: 30 * time.Second, CheckRedirect: sameOriginHTTPS}}, nil
+	tok := getenv("GITHUB_TOKEN")
+	if !validToken(tok) {
+		return nil, &Refusal{Code: ExitRefused, Msg: "GITHUB_TOKEN holds characters that cannot be sent in an Authorization header (it must be visible ASCII without spaces)"}
+	}
+	return &Client{API: api, GraphQL: gql, Token: tok, HTTP: &http.Client{Timeout: 30 * time.Second, CheckRedirect: sameOriginHTTPS}}, nil
+}
+
+// validToken reports whether a token can travel in an Authorization header:
+// empty (none) or visible ASCII with no space. A token with a control or other
+// character would make Go's own header error quote it, so it is refused first.
+func validToken(t string) bool {
+	for i := 0; i < len(t); i++ {
+		if t[i] <= ' ' || t[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// ScrubSecret removes a secret, and the spellings an error message may give it
+// (quoted, URL-escaped), from text that is about to be printed.
+func ScrubSecret(text, secret string) string {
+	if secret == "" {
+		return text
+	}
+	q := strconv.Quote(secret)
+	for _, v := range []string{secret, q[1 : len(q)-1], url.QueryEscape(secret), url.PathEscape(secret)} {
+		if v != "" {
+			text = strings.ReplaceAll(text, v, "[token]")
+		}
+	}
+	return text
 }
 
 // checkEndpoint requires an https URL with a host and no userinfo.
@@ -99,12 +131,7 @@ type Issue struct {
 }
 
 // scrub removes the credential from any text that could reach stderr.
-func (c *Client) scrub(s string) string {
-	if c.Token != "" {
-		s = strings.ReplaceAll(s, c.Token, "[token]")
-	}
-	return s
-}
+func (c *Client) scrub(s string) string { return ScrubSecret(s, c.Token) }
 
 func (c *Client) do(ctx context.Context, method, endpoint string, body any, out any) (int, error) {
 	if c.Token == "" {
@@ -120,7 +147,7 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any, out 
 	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, rd)
 	if err != nil {
-		return 0, err
+		return 0, &Refusal{Code: ExitRefused, Msg: "the GitHub request could not be built (the endpoint is not a valid URL)"}
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -370,7 +397,7 @@ func (c *Client) UpdateComment(ctx context.Context, repo string, id int64, body 
 func (c *Client) Ping(ctx context.Context) (reachable, accepted bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.API+"/rate_limit", nil)
 	if err != nil {
-		return false, false, err
+		return false, false, errors.New("the GitHub request could not be built (the endpoint is not a valid URL)")
 	}
 	if c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)

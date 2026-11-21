@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -330,5 +332,43 @@ func TestReportStatesAreCaseInsensitiveAndCollisionsRefused(t *testing.T) {
 	dup := &Config{Repositories: []string{"acme/app"}, Report: map[string]ReportAction{"FINISHED": {}, "finished": {}}}
 	if err := dup.normalize(); err == nil {
 		t.Fatal("two report keys that differ only in case must be refused")
+	}
+}
+
+// Joost F1: a request that cannot even be built must not print the credential,
+// in any spelling Go's own error might give it.
+func TestARequestThatCannotBeBuiltDoesNotEchoTheToken(t *testing.T) {
+	const tok = "ghp_SYNTH3TIC"
+	c := &Client{API: "https://h.example/" + tok + "\x7f", GraphQL: "https://h.example/" + tok + "\x7f", Token: tok, HTTP: http.DefaultClient}
+	_, err1 := c.GetIssue(context.Background(), "a/b", 1)
+	_, _, err2 := c.Ping(context.Background())
+	for _, err := range []error{err1, err2} {
+		if err == nil || strings.Contains(err.Error(), tok) || strings.Contains(err.Error(), "SYNTH3TIC") {
+			t.Errorf("error must exist and must not hold the token: %v", err)
+		}
+	}
+}
+
+func TestScrubSecretCoversTheSpellingsAnErrorMayUse(t *testing.T) {
+	const tok = "ghp_a b\x7f"
+	for _, text := range []string{"x " + tok, "x " + strconv.Quote(tok), "x " + url.QueryEscape(tok), "x " + url.PathEscape(tok)} {
+		if got := ScrubSecret(text, tok); strings.Contains(got, "ghp_") {
+			t.Errorf("%q -> %q", text, got)
+		}
+	}
+	if ScrubSecret("abc", "") != "abc" {
+		t.Error("an empty secret must change nothing")
+	}
+}
+
+func TestANonHeaderTokenIsRefusedWithoutEchoing(t *testing.T) {
+	_, err := NewClient(func(k string) string {
+		if k == "GITHUB_TOKEN" {
+			return "ghp_SYNTH3TIC\nX"
+		}
+		return ""
+	})
+	if err == nil || strings.Contains(err.Error(), "SYNTH3TIC") {
+		t.Fatalf("%v", err)
 	}
 }
