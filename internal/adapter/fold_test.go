@@ -770,3 +770,115 @@ func TestOnlyGitHubSayingTheCredentialHasNoAccountTrustsTheConfiguredAuthor(t *t
 		}
 	}
 }
+
+// ---- fold 8 (blind round 5: F2-F7) ----
+
+func TestIdentityIsResolvedBeforeAnyLabelWrite(t *testing.T) { // F2
+	for name, setup := range map[string]func(f *fakeGitHub, cfg *Config){
+		"a commentAuthor that is not the credential": func(f *fakeGitHub, cfg *Config) { cfg.CommentAuthor = "someone-else" },
+		"an identity lookup that fails":              func(f *fakeGitHub, cfg *Config) { f.FailNext["GET /user"] = true },
+	} {
+		for _, op := range []string{"mark-tracked", "untrack"} {
+			f := newFake(t)
+			f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
+			cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true}
+			_ = cfg.normalize()
+			setup(f, cfg)
+			a := newAdapter(t, f, cfg)
+			req := markRequest(issueURL("acme/app", 1))
+			if op == "untrack" {
+				req = `{"externalId":"` + issueURL("acme/app", 1) + `"}`
+			}
+			if _, r := call(t, a, op, req); r == nil {
+				t.Errorf("%s/%s: accepted", name, op)
+			}
+			if len(f.Writes) != 0 {
+				t.Errorf("%s/%s changed the issue before refusing: %v", name, op, f.Writes)
+			}
+		}
+	}
+}
+
+func TestA404OnDeleteIsGoneOnlyIfTheListNoLongerHasTheComment(t *testing.T) { // F3
+	serve := func(list string, listStatus int) *Client {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(listStatus)
+			_, _ = w.Write([]byte(list))
+		}))
+		t.Cleanup(srv.Close)
+		return &Client{API: srv.URL, Token: token, HTTP: srv.Client()}
+	}
+	ctx := context.Background()
+	if err := serve(`[]`, 200).DeleteComment(ctx, "a/b", 1, 7); err != nil {
+		t.Errorf("a comment that is really gone is fine: %v", err)
+	}
+	if err := serve(`[{"id":7,"body":"x","user":{"login":"u"}}]`, 200).DeleteComment(ctx, "a/b", 1, 7); err == nil {
+		t.Error("a 404 for a comment still on the issue was taken as removed")
+	}
+	if err := serve(`{}`, 404).DeleteComment(ctx, "a/b", 1, 7); err == nil {
+		t.Error("a 404 whose absence cannot be confirmed was taken as removed")
+	}
+}
+
+func TestAnIssueWithoutLabelDataIsRefusedNotTreatedAsUnlabelled(t *testing.T) { // F4
+	for name, labels := range map[string]string{
+		"no labels":      ``,
+		"null labels":    `"labels":null,`,
+		"null nodes":     `"labels":{"nodes":null,"pageInfo":{"hasNextPage":false}},`,
+		"no page info":   `"labels":{"nodes":[]},`,
+		"no hasNextPage": `"labels":{"nodes":[],"pageInfo":{}},`,
+	} {
+		body := `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false},"nodes":[{` + labels + `"number":1,"title":"t","url":"https://github.com/a/b/issues/1","state":"OPEN","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"}]}}}}`
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		c := &Client{API: srv.URL, GraphQL: srv.URL, Token: token, HTTP: srv.Client()}
+		if got, err := c.ReadIssues(context.Background(), "a/b", []string{"OPEN"}, "", 5); err == nil {
+			t.Errorf("%s: accepted as %v", name, got)
+		}
+		srv.Close()
+	}
+}
+
+func TestAWriteLookupOnTheWrongHostIsNotWritten(t *testing.T) { // F5
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"number":1,"title":"t","html_url":"https://evil.example/acme/app/issues/1","state":"open","labels":[]}`))
+	}))
+	defer srv.Close()
+	cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "x"}
+	_ = cfg.normalize()
+	a := &Adapter{Config: cfg, Host: "github.com", Client: &Client{API: srv.URL, Token: token, HTTP: srv.Client()}}
+	if _, _, err := a.writeTarget(context.Background(), issueURL("acme/app", 1)); err == nil {
+		t.Fatal("a lookup answered from another host was accepted for a write")
+	}
+}
+
+func TestCursorsAreCheckedAndBelongToTheirCall(t *testing.T) { // F6
+	good := cursorKey{Time: "2026-01-01T00:00:00Z", Repo: "acme/app", Number: 1}
+	if _, err := decodeCursor(encodeCursor("list-untracked", good), "list-untracked"); err != nil {
+		t.Fatalf("its own cursor: %v", err)
+	}
+	if _, err := decodeCursor(encodeCursor("list-untracked", good), "changed-since"); err == nil {
+		t.Error("a list-untracked cursor was accepted by changed-since")
+	}
+	for name, k := range map[string]cursorKey{
+		"a malformed time": {Time: "yesterday", Repo: "acme/app", Number: 1},
+		"a bad repository": {Time: "2026-01-01T00:00:00Z", Repo: "not a repo", Number: 1},
+	} {
+		if _, err := decodeCursor(encodeCursor("changed-since", k), "changed-since"); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+}
+
+func TestALeadWithSpacesInTheConfigMatchesTheRequest(t *testing.T) { // F7
+	c := &Config{Repositories: []string{"acme/app"}, Teams: []Team{{Label: " team-a ", Lead: " Iris "}}}
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if l, ok := c.teamLabelFor("Iris"); !ok || l != "team-a" {
+		t.Fatalf("%q %v", l, ok)
+	}
+}

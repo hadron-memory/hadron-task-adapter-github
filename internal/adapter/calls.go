@@ -194,7 +194,7 @@ func (a *Adapter) listUntracked(ctx context.Context, q *request) (any, error) {
 	}
 	var after *cursorKey
 	if q.Cursor != nil && *q.Cursor != "" {
-		k, err := decodeCursor(*q.Cursor)
+		k, err := decodeCursor(*q.Cursor, "list-untracked")
 		if err != nil {
 			return nil, err
 		}
@@ -235,7 +235,7 @@ func (a *Adapter) listUntracked(ctx context.Context, q *request) (any, error) {
 		out.Items = append(out.Items, itemOut{ExternalID: is.URL, Title: cleanText(is.Title, 1024)})
 	}
 	if more {
-		c := encodeCursor(cursorKey{Time: rest[len(rest)-1].CreatedAt, Repo: rest[len(rest)-1].Repo, Number: rest[len(rest)-1].Number})
+		c := encodeCursor("list-untracked", cursorKey{Time: rest[len(rest)-1].CreatedAt, Repo: rest[len(rest)-1].Repo, Number: rest[len(rest)-1].Number})
 		out.NextCursor = &c
 	}
 	return out, nil
@@ -295,21 +295,23 @@ type cursorKey struct {
 	Time   string `json:"t"` // the last item's timestamp (created, or updated for changed-since)
 	Repo   string `json:"r"` // its repository
 	Number int    `json:"n"` // its number
+	Call   string `json:"c"` // the call that issued it: the two listings order differently
 }
 
-func encodeCursor(k cursorKey) string {
+func encodeCursor(call string, k cursorKey) string {
+	k.Call = call
 	b, _ := json.Marshal(k)
 	return "v1." + base64.RawURLEncoding.EncodeToString(b)
 }
 
-func decodeCursor(s string) (cursorKey, error) {
+func decodeCursor(s, call string) (cursorKey, error) {
 	var k cursorKey
 	rest, ok := strings.CutPrefix(s, "v1.")
 	if !ok {
 		return k, &Refusal{Code: ExitUsage, Msg: "the cursor is not one this adapter issued"}
 	}
 	b, err := base64.RawURLEncoding.DecodeString(rest)
-	if err != nil || json.Unmarshal(b, &k) != nil || k.Time == "" || k.Repo == "" || k.Number < 1 {
+	if err != nil || json.Unmarshal(b, &k) != nil || k.Call != call || !validRepo(k.Repo) || k.Number < 1 || !validRFC3339(k.Time) {
 		return k, &Refusal{Code: ExitUsage, Msg: "the cursor is not one this adapter issued"}
 	}
 	return k, nil
@@ -350,9 +352,10 @@ func (a *Adapter) writeTarget(ctx context.Context, externalID string) (string, i
 		return "", 0, err
 	}
 	// GitHub follows a moved or renamed repository: write only to the issue the
-	// lookup really resolved, and only if it is still one the config lists.
-	if got, gn, ok := repoOfIssueURL(is.URL); !ok || gn != n || !strings.EqualFold(got, repo) {
-		return "", 0, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d now resolves to %s, which is not the listed repository; it is not written", repo, n, cleanText(is.URL, 200))}
+	// lookup really resolved, on the configured host and in a repository the
+	// config lists (the same check every read applies).
+	if err := a.inScope(is); err != nil {
+		return "", 0, err
 	}
 	return repo, n, nil
 }
@@ -381,6 +384,11 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if a.Config.Comment { // resolve the comment identity before ANY write, so a refusal changes nothing
+		if _, err := a.ownLogin(ctx); err != nil {
+			return nil, err
+		}
+	}
 	// Every write is idempotent, so a retry after a failure between them (the
 	// label set, the comment not) repairs it: the CLI leaves the claim standing
 	// and reports the failed mark, and running mark-tracked again completes it.
@@ -407,6 +415,11 @@ func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
 	repo, n, err := a.writeTarget(ctx, q.ExternalID)
 	if err != nil {
 		return nil, err
+	}
+	if a.Config.Comment { // identity first: a refusal must not leave the label removed
+		if _, err := a.ownLogin(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if a.Config.TrackedLabel != "" {
 		if err := a.Client.RemoveLabel(ctx, repo, n, a.Config.TrackedLabel); err != nil { // the issue exists: a 404 is the absent label
@@ -555,7 +568,7 @@ func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body st
 		if created.User.Login != "" && !strings.EqualFold(created.User.Login, login) {
 			who := "the comment was posted as " + strconv.Quote(cleanText(created.User.Login, 64)) + ", not commentAuthor " + strconv.Quote(cleanText(login, 64))
 			// undo it: it would not be recognised on a retry, which would post another
-			if derr := a.Client.DeleteComment(ctx, repo, created.ID); derr != nil {
+			if derr := a.Client.DeleteComment(ctx, repo, n, created.ID); derr != nil {
 				return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s, and it could not be removed (%s): delete comment %d on %s#%d by hand, then set commentAuthor to the credential's login", who, cleanText(a.Client.scrub(derr.Error()), 200), created.ID, repo, n)}
 			}
 			return &Refusal{Code: ExitRefused, Msg: who + "; it was removed. Set commentAuthor to the credential's login"}
@@ -581,7 +594,7 @@ func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body st
 		return err
 	}
 	for _, extra := range own[1:] {
-		if err := a.Client.DeleteComment(ctx, repo, extra.ID); err != nil {
+		if err := a.Client.DeleteComment(ctx, repo, n, extra.ID); err != nil {
 			return err
 		}
 	}
@@ -651,7 +664,7 @@ func (a *Adapter) changedSince(ctx context.Context, q *request) (any, error) {
 	}
 	var after *cursorKey
 	if q.Cursor != nil && *q.Cursor != "" {
-		k, err := decodeCursor(*q.Cursor)
+		k, err := decodeCursor(*q.Cursor, "changed-since")
 		if err != nil {
 			return nil, err
 		}
@@ -681,7 +694,7 @@ func (a *Adapter) changedSince(ctx context.Context, q *request) (any, error) {
 	})
 	start := 0
 	if after != nil {
-		for start < len(all) && !updatedAfter(*after, all[start]) {
+		for start < len(all) && !cursorBefore(*after, all[start]) {
 			start++
 		}
 	}
@@ -707,13 +720,15 @@ func (a *Adapter) changedSince(ctx context.Context, q *request) (any, error) {
 		out.Items = append(out.Items, changed{ExternalID: is.URL, Title: cleanText(is.Title, 1024), State: is.State, UpdatedAt: is.UpdatedAt})
 	}
 	if more {
-		c := encodeCursor(cursorKey{Time: rest[len(rest)-1].UpdatedAt, Repo: rest[len(rest)-1].Repo, Number: rest[len(rest)-1].Number})
+		c := encodeCursor("changed-since", cursorKey{Time: rest[len(rest)-1].UpdatedAt, Repo: rest[len(rest)-1].Repo, Number: rest[len(rest)-1].Number})
 		out.NextCursor = &c
 	}
 	return out, nil
 }
 
-func updatedAfter(k cursorKey, is Issue) bool {
+// cursorBefore reports whether the cursor position sorts strictly before the
+// issue in the update order, i.e. the issue comes after the cursor.
+func cursorBefore(k cursorKey, is Issue) bool {
 	if k.Time != is.UpdatedAt {
 		tk, ti := parseTime(k.Time), parseTime(is.UpdatedAt)
 		if !tk.Equal(ti) {
@@ -892,4 +907,9 @@ func (a *Adapter) inScope(is Issue) error {
 		return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d is at %s, outside the configured repositories; update the config", is.Repo, is.Number, cleanText(is.URL, 200))}
 	}
 	return nil
+}
+
+func validRFC3339(s string) bool {
+	_, err := time.Parse(time.RFC3339, s)
+	return err == nil
 }

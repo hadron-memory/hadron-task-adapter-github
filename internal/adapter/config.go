@@ -140,7 +140,8 @@ func (c *Config) normalize() error {
 		if strings.TrimSpace(t.Label) == "" || strings.TrimSpace(t.Lead) == "" {
 			return fmt.Errorf("teams[%d] needs a label and a lead", i)
 		}
-		l, w := strings.ToLower(t.Label), strings.ToLower(t.Lead)
+		c.Teams[i].Label, c.Teams[i].Lead = strings.TrimSpace(t.Label), strings.TrimSpace(t.Lead) // the request value is trimmed, so the config's is too
+		l, w := strings.ToLower(c.Teams[i].Label), strings.ToLower(c.Teams[i].Lead)
 		if teamLabels[l] || teamLeads[w] {
 			return fmt.Errorf("teams[%d] repeats a label or a lead", i)
 		}

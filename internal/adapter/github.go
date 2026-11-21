@@ -218,10 +218,10 @@ type rawIssue struct {
 	State     string `json:"state"`
 	CreatedAt string `json:"createdAt"`
 	UpdatedAt string `json:"updatedAt"`
-	Labels    struct {
+	Labels    *struct {
 		Nodes    []struct{ Name string } `json:"nodes"`
-		PageInfo struct {
-			HasNextPage bool `json:"hasNextPage"`
+		PageInfo *struct {
+			HasNextPage *bool `json:"hasNextPage"`
 		} `json:"pageInfo"`
 	} `json:"labels"`
 }
@@ -277,7 +277,12 @@ func (c *Client) ReadIssues(ctx context.Context, repo string, states []string, s
 			return nil, &Refusal{Code: ExitRefused, Msg: "GitHub's issues answer for " + repo + " is incomplete"}
 		}
 		for _, n := range is.Nodes {
-			if n.Labels.PageInfo.HasNextPage {
+			// Labels decide the filters: a missing or null label connection is an
+			// incomplete issue, never "no labels".
+			if n.Labels == nil || n.Labels.Nodes == nil || n.Labels.PageInfo == nil || n.Labels.PageInfo.HasNextPage == nil {
+				return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub's answer for %s#%d has no label data, so its filters cannot be decided", repo, n.Number)}
+			}
+			if *n.Labels.PageInfo.HasNextPage {
 				return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has more than %d labels, so its filters cannot be decided", repo, n.Number, labelsPerIssue)}
 			}
 			labels := make([]string, 0, len(n.Labels.Nodes))
@@ -396,9 +401,20 @@ type commentLimit struct{ *Refusal }
 func (e commentLimit) Unwrap() error { return e.Refusal }
 
 // DeleteComment deletes a comment by id; one already gone is not an error.
-func (c *Client) DeleteComment(ctx context.Context, repo string, id int64) error {
+func (c *Client) DeleteComment(ctx context.Context, repo string, n int, id int64) error {
 	code, err := c.do(ctx, http.MethodDelete, fmt.Sprintf("%s/repos/%s/issues/comments/%d", c.API, repo, id), nil, nil)
 	if code == http.StatusNotFound {
+		// 404 is also what GitHub says when access is lost: it counts as "already
+		// gone" only if the issue's readable comment list no longer has it.
+		all, lerr := c.ListComments(ctx, repo, n, 10)
+		if lerr != nil {
+			return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered 404 deleting comment %d and its absence could not be confirmed: %s", id, cleanText(c.scrub(lerr.Error()), 200))}
+		}
+		for _, x := range all {
+			if x.ID == id {
+				return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered 404 deleting comment %d, which is still on %s#%d", id, repo, n)}
+			}
+		}
 		return nil
 	}
 	return err

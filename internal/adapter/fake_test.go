@@ -199,6 +199,7 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request) {
 	nodes := []node{}
 	for _, is := range list[start:end] {
 		n := node{Number: is.Number, Title: is.Title, URL: "https://github.com/" + f.shownRepo(repo) + "/issues/" + strconv.Itoa(is.Number), State: is.State, CreatedAt: is.CreatedAt, UpdatedAt: is.UpdatedAt}
+		n.Labels.Nodes = []map[string]string{}
 		for _, l := range is.Labels {
 			n.Labels.Nodes = append(n.Labels.Nodes, map[string]string{"name": l})
 		}
