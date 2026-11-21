@@ -96,23 +96,28 @@ mark, and running `mark-tracked` again completes it (the exception is an issue w
 with exactly one adapter comment (the oldest is kept and the adapter's own extras
 are deleted).
 
-**Ids with no tracker item.** Two kinds of external id have nothing on GitHub to
-write to, and the three write calls (`mark-tracked`, `untrack`, `report`) answer
-the usual empty object `{}` for them **without making any GitHub request** (no
-write, and no read either, so their existence is not checked):
+**Ids with no tracker item.** The adapter writes only to a **bare, canonical issue
+URL in a listed repository** (what it issues). The CLI tells it about every Hadron
+task that carries an external id, and most of those are not its items, so for any
+other id the three write calls (`mark-tracked`, `untrack`, `report`) answer the
+usual empty object `{}` **without making any GitHub request** (no write, and no
+read, so existence is not checked). That covers:
 
-- an issue URL in a listed repository plus a `#fragment`: teams give several Hadron
-  tasks one issue by suffixing a label (`.../issues/2520#build`), and the issue
-  belongs to the task that holds the bare URL;
-- a pull request URL in a listed repository, with or without a fragment.
+- an issue URL plus a `#fragment` (teams give several Hadron tasks one issue by
+  suffixing a label, `.../issues/2520#build`; the issue belongs to the task that
+  holds the bare URL);
+- a pull request URL;
+- an issue or pull request in a repository the config does not list, or on another host;
+- an id from another system altogether (CI run ids, `fit:...` markers);
+- a GitHub URL that is not canonical (a query, trailing slash, extra or encoded
+  path, empty or repeated fragment, leading-zero or signed number).
 
 A refusal there would hold the CLI's reconcile cursor and fail every later run on
-one old task. Everything else that is not an issue in a listed repository is still
-refused by the call's normal check, and an external id is read strictly: `https`, the
-host, `owner/name/issues/N` or `.../pull/N` with a plain positive number, an
-optional non-empty `#fragment`, and no query, trailing slash, extra path, encoded
-path or userinfo. The request's own checks (the task and worker of `mark-tracked`)
-still come first. The comment scan completes only below 1,000 comments; at 1,000 or more it refuses
+one old task. What is still refused is an id the platform's own id rules reject
+(whitespace, control characters, userinfo, over-long), which no task can carry. The
+request's own checks (the task and worker of `mark-tracked`) still come first, and a
+read (`get`, `normalize`) of a non-issue id is still refused. A team that lists a
+new repository in the config starts writing to its issues from then on, not before. The comment scan completes only below 1,000 comments; at 1,000 or more it refuses
 rather than guess the adapter has none.
 
 ## The calls
