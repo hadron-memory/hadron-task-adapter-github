@@ -1,0 +1,681 @@
+package adapter
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
+
+// Contract constants (cor:agt:120:04, contract version 1).
+const (
+	ContractVersion = 1
+	AdapterName     = "hadron-task-adapter-github"
+	maxPage         = 100
+	defaultPage     = 20
+	maxExternalID   = 512 // code points, the server's cap
+	maxBodyRunes    = 64 << 10
+	commentMarker   = "<!-- hadron-task:"
+)
+
+// Exit codes. The CLI treats every non-zero exit as the adapter's refusal and
+// shows the first 4 KiB of stderr, so each carries a one-line message.
+const (
+	ExitRefused  = 1 // GitHub or the config refused or failed
+	ExitUsage    = 2 // the request is malformed
+	ExitNotFound = 4 // the item does not exist
+)
+
+// Refusal is an error that exits with Code and prints Msg on stderr.
+type Refusal struct {
+	Code int
+	Msg  string
+}
+
+func (r *Refusal) Error() string { return r.Msg }
+
+// Calls lists every call this adapter answers, core first.
+var Calls = []string{"describe", "list-untracked", "mark-tracked", "untrack", "get", "report", "changed-since", "normalize", "check"}
+
+// Adapter is one invocation's state.
+type Adapter struct {
+	Config *Config
+	Client *Client
+	Host   string // the tracker's web host, e.g. github.com
+	Now    func() time.Time
+}
+
+// Handle runs one call: stdin is the request object, the returned value is the
+// single answer object. A *Refusal carries the exit code.
+func (a *Adapter) Handle(ctx context.Context, call string, stdin io.Reader) (any, error) {
+	if call == "describe" {
+		return Describe(), nil // answers without a config or a credential
+	}
+	req, err := decodeRequest(stdin)
+	if err != nil {
+		return nil, err
+	}
+	if a.Config == nil || a.Client == nil {
+		return nil, &Refusal{Code: ExitRefused, Msg: "the adapter is not configured"}
+	}
+	switch call {
+	case "list-untracked":
+		return a.listUntracked(ctx, req)
+	case "mark-tracked":
+		return a.markTracked(ctx, req)
+	case "untrack":
+		return a.untrack(ctx, req)
+	case "get":
+		return a.get(ctx, req)
+	case "report":
+		return a.report(ctx, req)
+	case "changed-since":
+		return a.changedSince(ctx, req)
+	case "normalize":
+		return a.normalize(ctx, req)
+	case "check":
+		return a.check(ctx)
+	}
+	return nil, &Refusal{Code: ExitUsage, Msg: "unknown call " + strconv.Quote(call) + "; the calls are " + strings.Join(Calls, ", ")}
+}
+
+// Describe is the adapter's self-description.
+func Describe() map[string]any {
+	return map[string]any{
+		"name":            AdapterName,
+		"contractVersion": ContractVersion,
+		"calls":           Calls,
+		"filters":         []string{"for"},
+		"order":           "oldest-first",
+	}
+}
+
+type request struct {
+	ContractVersion *int            `json:"contractVersion"`
+	For             *string         `json:"for"`
+	Limit           *int            `json:"limit"`
+	Cursor          *string         `json:"cursor"`
+	ExternalID      string          `json:"externalId"`
+	Reference       string          `json:"reference"`
+	Since           string          `json:"since"`
+	State           string          `json:"state"`
+	Task            json.RawMessage `json:"task"`
+	Worker          json.RawMessage `json:"worker"`
+}
+
+func decodeRequest(r io.Reader) (*request, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, 1<<20))
+	if err != nil || len(strings.TrimSpace(string(raw))) == 0 {
+		return nil, &Refusal{Code: ExitUsage, Msg: "the request is empty: one JSON object is expected on stdin"}
+	}
+	var q request
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return nil, &Refusal{Code: ExitUsage, Msg: "the request is not one JSON object"}
+	}
+	if q.ContractVersion != nil && *q.ContractVersion != ContractVersion {
+		return nil, &Refusal{Code: ExitUsage, Msg: fmt.Sprintf("this adapter speaks contract version %d, the request says %d", ContractVersion, *q.ContractVersion)}
+	}
+	return &q, nil
+}
+
+// ---- list-untracked ----
+
+type itemOut struct {
+	ExternalID string `json:"externalId"`
+	Title      string `json:"title"`
+}
+
+type pageOut struct {
+	Items      []itemOut `json:"items"`
+	NextCursor *string   `json:"nextCursor"`
+}
+
+func (a *Adapter) listUntracked(ctx context.Context, q *request) (any, error) {
+	limit := defaultPage
+	if q.Limit != nil {
+		if *q.Limit < 1 || *q.Limit > maxPage {
+			return nil, &Refusal{Code: ExitUsage, Msg: fmt.Sprintf("limit must be 1 to %d", maxPage)}
+		}
+		limit = *q.Limit
+	}
+	teamLabel := ""
+	if q.For != nil && *q.For != "" {
+		l, ok := a.Config.teamLabelFor(*q.For)
+		if !ok {
+			return nil, &Refusal{Code: ExitUsage, Msg: "no team in the config is led by " + strconv.Quote(*q.For)}
+		}
+		teamLabel = l
+	}
+	var after *cursorKey
+	if q.Cursor != nil && *q.Cursor != "" {
+		k, err := decodeCursor(*q.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		after = &k
+	}
+	var all []Issue
+	for _, repo := range a.Config.Repositories {
+		issues, err := a.Client.ReadIssues(ctx, repo, []string{"OPEN"}, "", a.Config.maxPages())
+		if err != nil {
+			return nil, err
+		}
+		for _, is := range issues {
+			if a.Config.passes(is.Labels, teamLabel) {
+				all = append(all, is)
+			}
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return lessCreated(all[i], all[j]) })
+	start := 0
+	if after != nil {
+		for start < len(all) && !after.before(all[start]) {
+			start++
+		}
+	}
+	rest := all[start:]
+	more := len(rest) > limit
+	if more {
+		rest = rest[:limit]
+	}
+	out := pageOut{Items: make([]itemOut, 0, len(rest))}
+	for _, is := range rest {
+		if err := checkExternalID(is.URL); err != nil {
+			return nil, err
+		}
+		out.Items = append(out.Items, itemOut{ExternalID: is.URL, Title: cleanText(is.Title, 1024)})
+	}
+	if more {
+		c := encodeCursor(cursorKey{T: rest[len(rest)-1].CreatedAt, R: rest[len(rest)-1].Repo, N: rest[len(rest)-1].Number})
+		out.NextCursor = &c
+	}
+	return out, nil
+}
+
+func (c *Config) teamLabelFor(lead string) (string, bool) {
+	for _, t := range c.Teams {
+		if strings.EqualFold(t.Lead, strings.TrimSpace(lead)) {
+			return t.Label, true
+		}
+	}
+	return "", false
+}
+
+// passes applies the label model: excluded labels, the team label, ready.
+func (c *Config) passes(labels []string, teamLabel string) bool {
+	has := map[string]bool{}
+	for _, l := range labels {
+		has[strings.ToLower(l)] = true
+	}
+	for _, l := range c.ExcludeLabels {
+		if has[strings.ToLower(l)] {
+			return false
+		}
+	}
+	if teamLabel != "" && !has[strings.ToLower(teamLabel)] {
+		return false
+	}
+	if c.RequireReady && !has[strings.ToLower(c.ReadyLabel)] {
+		return false
+	}
+	return true
+}
+
+func lessCreated(a, b Issue) bool {
+	if a.CreatedAt != b.CreatedAt {
+		ta, tb := parseTime(a.CreatedAt), parseTime(b.CreatedAt)
+		if !ta.Equal(tb) {
+			return ta.Before(tb)
+		}
+		return a.CreatedAt < b.CreatedAt
+	}
+	if a.Repo != b.Repo {
+		return a.Repo < b.Repo
+	}
+	return a.Number < b.Number
+}
+
+func parseTime(s string) time.Time {
+	t, _ := time.Parse(time.RFC3339, s)
+	return t
+}
+
+// ---- cursor: an opaque keyset position, never an offset ----
+
+type cursorKey struct {
+	T string `json:"t"` // the last item's timestamp
+	R string `json:"r"` // its repository
+	N int    `json:"n"` // its number
+}
+
+func encodeCursor(k cursorKey) string {
+	b, _ := json.Marshal(k)
+	return "v1." + base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeCursor(s string) (cursorKey, error) {
+	var k cursorKey
+	rest, ok := strings.CutPrefix(s, "v1.")
+	if !ok {
+		return k, &Refusal{Code: ExitUsage, Msg: "the cursor is not one this adapter issued"}
+	}
+	b, err := base64.RawURLEncoding.DecodeString(rest)
+	if err != nil || json.Unmarshal(b, &k) != nil || k.T == "" || k.R == "" || k.N < 1 {
+		return k, &Refusal{Code: ExitUsage, Msg: "the cursor is not one this adapter issued"}
+	}
+	return k, nil
+}
+
+// before reports whether the cursor position is strictly before is, in the
+// created order (the next page starts at the first item it is before).
+func (k cursorKey) before(is Issue) bool {
+	return lessCreated(Issue{CreatedAt: k.T, Repo: k.R, Number: k.N}, is)
+}
+
+// ---- mark-tracked, untrack, report ----
+
+type taskIn struct {
+	ID        string `json:"id"`
+	Handle    string `json:"handle"`
+	PortalURL string `json:"portalUrl"`
+}
+
+type workerIn struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+	Model string `json:"model"`
+}
+
+func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
+	repo, n, err := a.parseExternalID(q.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+	var task taskIn
+	var worker workerIn
+	if len(q.Task) == 0 || json.Unmarshal(q.Task, &task) != nil || task.ID == "" {
+		return nil, &Refusal{Code: ExitUsage, Msg: "mark-tracked needs the task (its id)"}
+	}
+	_ = json.Unmarshal(q.Worker, &worker)
+	if a.Config.TrackedLabel != "" {
+		if err := a.Client.AddLabels(ctx, repo, n, a.Config.TrackedLabel); err != nil {
+			return nil, err
+		}
+	}
+	if a.Config.Comment {
+		if err := a.upsertComment(ctx, repo, n, trackedComment(task, worker)); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]any{}, nil
+}
+
+func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
+	repo, n, err := a.parseExternalID(q.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+	if a.Config.TrackedLabel != "" {
+		if err := a.Client.RemoveLabel(ctx, repo, n, a.Config.TrackedLabel); err != nil {
+			return nil, err
+		}
+	}
+	if a.Config.Comment {
+		id, err := a.findComment(ctx, repo, n)
+		if err != nil {
+			return nil, err
+		}
+		if id != 0 {
+			if err := a.Client.UpdateComment(ctx, repo, id, commentMarker+"released -->\nNo longer tracked in Hadron: the task was released."); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return map[string]any{}, nil
+}
+
+func (a *Adapter) report(ctx context.Context, q *request) (any, error) {
+	repo, n, err := a.parseExternalID(q.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+	act, ok := a.Config.Report[strings.ToUpper(strings.TrimSpace(q.State))]
+	if !ok {
+		act, ok = a.Config.Report[q.State]
+	}
+	if !ok {
+		return map[string]any{}, nil // no action configured for this state
+	}
+	if err := a.Client.AddLabels(ctx, repo, n, act.AddLabels...); err != nil {
+		return nil, err
+	}
+	for _, l := range act.RemoveLabels {
+		if err := a.Client.RemoveLabel(ctx, repo, n, l); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]any{}, nil
+}
+
+func trackedComment(t taskIn, w workerIn) string {
+	var b strings.Builder
+	b.WriteString(commentMarker + cleanText(t.ID, 128) + " -->\n")
+	b.WriteString("Tracked in Hadron by ")
+	name := cleanText(w.Name, 128)
+	if name == "" {
+		name = "a worker"
+	}
+	b.WriteString(name)
+	if w.Role != "" {
+		b.WriteString(" (" + cleanText(w.Role, 64) + ")")
+	}
+	b.WriteString(".")
+	label := cleanText(t.Handle, 64)
+	if label == "" {
+		label = cleanText(t.ID, 128)
+	}
+	if u := safeHTTPS(t.PortalURL); u != "" {
+		b.WriteString("\nTask: [" + label + "](" + u + ")")
+	} else {
+		b.WriteString("\nTask: " + label)
+	}
+	return b.String()
+}
+
+// safeHTTPS returns u when it is an https URL without userinfo or whitespace.
+func safeHTTPS(u string) string {
+	p, err := url.Parse(u)
+	if err != nil || p.Scheme != "https" || p.Host == "" || p.User != nil || strings.ContainsAny(u, " \t\r\n()<>") {
+		return ""
+	}
+	return u
+}
+
+func (a *Adapter) findComment(ctx context.Context, repo string, n int) (int64, error) {
+	cs, err := a.Client.ListComments(ctx, repo, n, 10)
+	if err != nil {
+		return 0, err
+	}
+	for _, c := range cs {
+		if strings.HasPrefix(c.Body, commentMarker) {
+			return c.ID, nil
+		}
+	}
+	return 0, nil
+}
+
+func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body string) error {
+	id, err := a.findComment(ctx, repo, n)
+	if err != nil {
+		return err
+	}
+	if id != 0 {
+		return a.Client.UpdateComment(ctx, repo, id, body)
+	}
+	return a.Client.CreateComment(ctx, repo, n, body)
+}
+
+// ---- get, normalize, check ----
+
+func (a *Adapter) get(ctx context.Context, q *request) (any, error) {
+	repo, n, err := a.parseExternalID(q.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+	is, err := a.Client.GetIssue(ctx, repo, n)
+	if err != nil {
+		return nil, err
+	}
+	body, truncated := truncateRunes(is.Body, maxBodyRunes)
+	return map[string]any{"externalId": is.URL, "title": cleanText(is.Title, 1024), "body": body, "bodyTruncated": truncated, "state": is.State, "url": is.URL}, nil
+}
+
+func (a *Adapter) normalize(ctx context.Context, q *request) (any, error) {
+	repo, n, err := a.parseReference(q.Reference)
+	if err != nil {
+		return nil, err
+	}
+	// The canonical form is the URL GitHub itself gives the issue (its real
+	// capitalisation), and the lookup also proves it is an issue.
+	is, err := a.Client.GetIssue(ctx, repo, n)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkExternalID(is.URL); err != nil {
+		return nil, err
+	}
+	return map[string]any{"externalId": is.URL}, nil
+}
+
+func (a *Adapter) check(ctx context.Context) (any, error) {
+	reachable, accepted, err := a.Client.Ping(ctx)
+	out := map[string]any{"credentialPresent": a.Client.Token != "", "credentialValid": accepted, "reachable": reachable}
+	if err != nil {
+		out["detail"] = a.Client.scrub(err.Error())
+	}
+	return out, nil
+}
+
+func (a *Adapter) changedSince(ctx context.Context, q *request) (any, error) {
+	if _, err := time.Parse(time.RFC3339, q.Since); err != nil {
+		return nil, &Refusal{Code: ExitUsage, Msg: "changed-since needs since as an RFC 3339 time"}
+	}
+	limit := defaultPage
+	if q.Limit != nil {
+		if *q.Limit < 1 || *q.Limit > maxPage {
+			return nil, &Refusal{Code: ExitUsage, Msg: fmt.Sprintf("limit must be 1 to %d", maxPage)}
+		}
+		limit = *q.Limit
+	}
+	var after *cursorKey
+	if q.Cursor != nil && *q.Cursor != "" {
+		k, err := decodeCursor(*q.Cursor)
+		if err != nil {
+			return nil, err
+		}
+		after = &k
+	}
+	var all []Issue
+	for _, repo := range a.Config.Repositories {
+		issues, err := a.Client.ReadIssues(ctx, repo, []string{"OPEN", "CLOSED"}, q.Since, a.Config.maxPages())
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, issues...)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		x, y := all[i], all[j]
+		if x.UpdatedAt != y.UpdatedAt {
+			tx, ty := parseTime(x.UpdatedAt), parseTime(y.UpdatedAt)
+			if !tx.Equal(ty) {
+				return tx.Before(ty)
+			}
+			return x.UpdatedAt < y.UpdatedAt
+		}
+		if x.Repo != y.Repo {
+			return x.Repo < y.Repo
+		}
+		return x.Number < y.Number
+	})
+	start := 0
+	if after != nil {
+		for start < len(all) && !updatedAfter(*after, all[start]) {
+			start++
+		}
+	}
+	rest := all[start:]
+	more := len(rest) > limit
+	if more {
+		rest = rest[:limit]
+	}
+	type changed struct {
+		ExternalID string `json:"externalId"`
+		Title      string `json:"title"`
+		State      string `json:"state"`
+		UpdatedAt  string `json:"updatedAt"`
+	}
+	out := struct {
+		Items      []changed `json:"items"`
+		NextCursor *string   `json:"nextCursor"`
+	}{Items: make([]changed, 0, len(rest))}
+	for _, is := range rest {
+		out.Items = append(out.Items, changed{ExternalID: is.URL, Title: cleanText(is.Title, 1024), State: is.State, UpdatedAt: is.UpdatedAt})
+	}
+	if more {
+		c := encodeCursor(cursorKey{T: rest[len(rest)-1].UpdatedAt, R: rest[len(rest)-1].Repo, N: rest[len(rest)-1].Number})
+		out.NextCursor = &c
+	}
+	return out, nil
+}
+
+func updatedAfter(k cursorKey, is Issue) bool {
+	if k.T != is.UpdatedAt {
+		tk, ti := parseTime(k.T), parseTime(is.UpdatedAt)
+		if !tk.Equal(ti) {
+			return tk.Before(ti)
+		}
+		return k.T < is.UpdatedAt
+	}
+	if k.R != is.Repo {
+		return k.R < is.Repo
+	}
+	return k.N < is.Number
+}
+
+// ---- external ids and references ----
+
+// parseExternalID reads the canonical issue URL the adapter itself issued.
+func (a *Adapter) parseExternalID(id string) (repo string, n int, err error) {
+	if err := checkExternalID(id); err != nil {
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId is not a valid id: " + err.Error()}
+	}
+	repo, n, ok := a.issueFromURL(id)
+	if !ok {
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId is not an issue URL on " + a.host()}
+	}
+	if !a.Config.inRepositories(repo) {
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId names a repository the config does not list"}
+	}
+	return strings.ToLower(repo), n, nil
+}
+
+func (a *Adapter) host() string {
+	if a.Host != "" {
+		return a.Host
+	}
+	return "github.com"
+}
+
+func (a *Adapter) issueFromURL(raw string) (repo string, n int, ok bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || !strings.EqualFold(strings.TrimPrefix(u.Host, "www."), a.host()) {
+		return "", 0, false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 4 || parts[2] != "issues" {
+		return "", 0, false
+	}
+	num, err := strconv.Atoi(parts[3])
+	if err != nil || num < 1 {
+		return "", 0, false
+	}
+	return parts[0] + "/" + parts[1], num, true
+}
+
+// parseReference reads a short or sloppy reference: an issue URL (any case,
+// http, www, a trailing slash, a query or fragment), owner/repo#N, or #N with a
+// defaultRepository.
+func (a *Adapter) parseReference(ref string) (string, int, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "normalize needs a reference"}
+	}
+	repo, numText, hash := "", "", strings.LastIndex(ref, "#")
+	switch {
+	case strings.Contains(ref, "://"):
+		u, err := url.Parse(ref)
+		if err != nil || u.User != nil {
+			return "", 0, &Refusal{Code: ExitUsage, Msg: "the reference is not an issue URL"}
+		}
+		u.Scheme = "https"
+		u.RawQuery, u.Fragment = "", ""
+		r, n, ok := a.issueFromURL(u.String())
+		if !ok {
+			return "", 0, &Refusal{Code: ExitUsage, Msg: "the reference is not an issue URL on " + a.host()}
+		}
+		repo, numText = r, strconv.Itoa(n)
+	case hash == 0:
+		if a.Config.DefaultRepository == "" {
+			return "", 0, &Refusal{Code: ExitUsage, Msg: "a bare #N needs defaultRepository in the config"}
+		}
+		repo, numText = a.Config.DefaultRepository, ref[1:]
+	case hash > 0:
+		repo, numText = ref[:hash], ref[hash+1:]
+	default:
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "the reference is not owner/repo#N, #N or an issue URL"}
+	}
+	n, err := strconv.Atoi(numText)
+	if err != nil || n < 1 || !validRepo(strings.ToLower(repo)) {
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "the reference is not owner/repo#N, #N or an issue URL"}
+	}
+	repo = strings.ToLower(repo)
+	if !a.Config.inRepositories(repo) {
+		return "", 0, &Refusal{Code: ExitUsage, Msg: "the reference names a repository the config does not list"}
+	}
+	return repo, n, nil
+}
+
+// checkExternalID applies the id rules the server applies (cor:agt:120:02): 1 to
+// 512 code points, no whitespace, control or invisible format characters, no
+// userinfo. The adapter never returns an id that fails them.
+func checkExternalID(id string) error {
+	if id == "" {
+		return errors.New("empty")
+	}
+	if utf8.RuneCountInString(id) > maxExternalID {
+		return fmt.Errorf("longer than %d characters", maxExternalID)
+	}
+	for _, r := range id {
+		if unicode.IsSpace(r) || unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) {
+			return errors.New("holds whitespace or a control or invisible character")
+		}
+	}
+	if u, err := url.Parse(id); err == nil && u.User != nil {
+		return errors.New("holds userinfo")
+	}
+	return nil
+}
+
+// cleanText makes tracker text safe to show: control and format characters
+// become spaces, and it is cut at max bytes on a rune boundary.
+func cleanText(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			r = ' '
+		}
+		if b.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func truncateRunes(s string, max int) (string, bool) {
+	if utf8.RuneCountInString(s) <= max {
+		return s, false
+	}
+	r := []rune(s)
+	return string(r[:max]), true
+}
