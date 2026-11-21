@@ -27,7 +27,7 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 	}
 	call := args[0]
 	if !slices.Contains(adapter.Calls, call) { // before any setup: a wrong call is a usage error whatever the environment holds
-		fmt.Fprintln(stderr, "unknown call "+strconv.Quote(oneLine(call, 60))+"; the calls are "+strings.Join(adapter.Calls, ", "))
+		fmt.Fprintln(stderr, "unknown call "+strconv.Quote(oneLine(adapter.ScrubSecret(call, getenv("GITHUB_TOKEN")), 60))+"; the calls are "+strings.Join(adapter.Calls, ", "))
 		return adapter.ExitUsage
 	}
 	a := &adapter.Adapter{Host: hostOf(getenv("GITHUB_SERVER_URL"))}
@@ -40,6 +40,7 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 			// check is how a bad setup is diagnosed: it answers (after judging the request) and says why
 			a.ClientError = adapter.ScrubSecret(err.Error(), getenv("GITHUB_TOKEN"))
 			a.CredentialAsked = getenv("GITHUB_TOKEN") != ""
+			a.Secret = getenv("GITHUB_TOKEN")
 		}
 		a.Client = client
 		path, err := adapter.ConfigPath(getenv, os.UserHomeDir)

@@ -67,6 +67,8 @@ type Adapter struct {
 	// or token); only `check` runs without one, and reports it.
 	ClientError     string
 	CredentialAsked bool
+	// Secret is the credential, so what check prints without a client is scrubbed too.
+	Secret string
 }
 
 // Handle runs one call: stdin is the request object, the returned value is the
@@ -541,8 +543,12 @@ func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body st
 			return err
 		}
 		if created.User.Login != "" && !strings.EqualFold(created.User.Login, login) {
-			_ = a.Client.DeleteComment(ctx, repo, created.ID) // undo: it would not be recognised on a retry
-			return &Refusal{Code: ExitRefused, Msg: "the comment was posted as " + strconv.Quote(cleanText(created.User.Login, 64)) + ", not commentAuthor " + strconv.Quote(cleanText(login, 64)) + "; it was removed. Set commentAuthor to the credential's login"}
+			who := "the comment was posted as " + strconv.Quote(cleanText(created.User.Login, 64)) + ", not commentAuthor " + strconv.Quote(cleanText(login, 64))
+			// undo it: it would not be recognised on a retry, which would post another
+			if derr := a.Client.DeleteComment(ctx, repo, created.ID); derr != nil {
+				return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s, and it could not be removed (%s): delete comment %d on %s#%d by hand, then set commentAuthor to the credential's login", who, cleanText(a.Client.scrub(derr.Error()), 200), created.ID, repo, n)}
+			}
+			return &Refusal{Code: ExitRefused, Msg: who + "; it was removed. Set commentAuthor to the credential's login"}
 		}
 		own, err = a.ownComments(ctx, repo, n)
 		var lim commentLimit
@@ -849,9 +855,9 @@ func repoOfIssueURL(raw string) (repo string, n int, ok bool) {
 // checkWithoutClient is check's answer when the client could not be built: the
 // setup problem and, independently, whether the config is valid.
 func (a *Adapter) checkWithoutClient() map[string]any {
-	out := map[string]any{"credentialPresent": a.CredentialAsked, "credentialValid": false, "reachable": false, "configValid": a.Config != nil, "detail": cleanText(a.ClientError, 512)}
+	out := map[string]any{"credentialPresent": a.CredentialAsked, "credentialValid": false, "reachable": false, "configValid": a.Config != nil, "detail": cleanText(ScrubSecret(a.ClientError, a.Secret), 512)}
 	if a.ConfigError != "" {
-		out["configDetail"] = cleanText(a.ConfigError, 512)
+		out["configDetail"] = cleanText(ScrubSecret(a.ConfigError, a.Secret), 512)
 	}
 	return out
 }

@@ -597,3 +597,32 @@ func TestALabelRemovalThatAnsweredNotFoundIsCheckedAgainstTheIssue(t *testing.T)
 		t.Error("a 404 on a vanished issue was taken as success")
 	}
 }
+
+// ---- fold 5 (LOCAL P1/P2, QA P2 at 59c86479) ----
+
+func TestACleanupThatFailedIsNotReportedAsRemoved(t *testing.T) {
+	f := newFake(t)
+	f.Login = "-"
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	f.FailNext["DELETE /repos/acme/app/issues/comments/1001"] = true
+	cfg := commentCfg()
+	cfg.CommentAuthor = "wrong-bot"
+	a := newAdapter(t, f, cfg)
+	_, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if r == nil || !strings.Contains(r.Msg, "could not be removed") || !strings.Contains(r.Msg, "1001") || strings.Contains(r.Msg, "it was removed") {
+		t.Fatalf("the failed cleanup must be said, with the comment to delete by hand: %v", r)
+	}
+	if len(is.Comments) != 1 {
+		t.Fatalf("the comment is still there, got %d", len(is.Comments))
+	}
+}
+
+func TestCheckWithoutAClientNeverPrintsTheTokenInEitherDetail(t *testing.T) {
+	a := &Adapter{Host: "github.com", Secret: "ghp_SYNTH3TIC", CredentialAsked: true,
+		ClientError: "bad endpoint ghp_SYNTH3TIC", ConfigError: "cannot read the config /x/ghp_SYNTH3TIC.json"}
+	out, err := a.Handle(context.Background(), "check", strings.NewReader(`{"contractVersion":1}`))
+	b, _ := json.Marshal(out)
+	if err != nil || strings.Contains(string(b), "SYNTH3TIC") {
+		t.Fatalf("%v %s", err, b)
+	}
+}

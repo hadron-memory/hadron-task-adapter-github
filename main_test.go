@@ -140,3 +140,18 @@ func TestTheHTTPRefusalNamesTheAPIURLEveryTime(t *testing.T) {
 		TestAPlainHTTPEndpointIsRefusedBeforeAnyRequest(t)
 	}
 }
+
+func TestCompiledCheckWithABadEndpointAndATokenBearingConfigPathPrintsNoToken(t *testing.T) {
+	const tok = "ghp_SYNTH3TIC"
+	code, out, errText := runCall(t, map[string]string{"GITHUB_TOKEN": tok, "GITHUB_API_URL": "http://invalid.example", "GITHUB_ADAPTER_CONFIG": "/nonexistent/" + tok + ".json"}, []string{"check"}, `{"contractVersion":1}`)
+	if code != 0 || strings.Contains(out+errText, "SYNTH3TIC") || !strings.Contains(out, `"configValid":false`) {
+		t.Fatalf("%d %q %q", code, out, errText)
+	}
+}
+
+func TestAnUnknownCallThatIsTheTokenIsNotEchoed(t *testing.T) {
+	code, _, errText := runCall(t, map[string]string{"GITHUB_TOKEN": "ghp_SYNTH3TIC"}, []string{"ghp_SYNTH3TIC"}, `{}`)
+	if code != 2 || strings.Contains(errText, "SYNTH3TIC") {
+		t.Fatalf("%d %q", code, errText)
+	}
+}
