@@ -34,10 +34,12 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 	if call != "describe" {
 		client, err := adapter.NewClient(getenv)
 		if err != nil {
-			if call == "check" { // check is how a bad setup is diagnosed: answer, do not refuse
-				return answer(stdout, stderr, adapter.SetupFailure(getenv("GITHUB_TOKEN"), err), getenv("GITHUB_TOKEN"))
+			if call != "check" {
+				return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 			}
-			return refuse(stderr, err, getenv("GITHUB_TOKEN"))
+			// check is how a bad setup is diagnosed: it answers (after judging the request) and says why
+			a.ClientError = adapter.ScrubSecret(err.Error(), getenv("GITHUB_TOKEN"))
+			a.CredentialAsked = getenv("GITHUB_TOKEN") != ""
 		}
 		a.Client = client
 		path, err := adapter.ConfigPath(getenv, os.UserHomeDir)

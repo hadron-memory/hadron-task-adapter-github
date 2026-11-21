@@ -450,7 +450,7 @@ func TestAConfigWithAStrayClosingDelimiterIsRefused(t *testing.T) {
 	}
 }
 
-func TestTwoSimultaneousMarksLeaveOneCommentAndBothSucceed(t *testing.T) {
+func TestAMarkRemovesTheDuplicateCommentsAConcurrentMarkLeft(t *testing.T) {
 	f := newFake(t)
 	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
 	cfg := &Config{Repositories: []string{"acme/app"}, Comment: true}
@@ -466,5 +466,134 @@ func TestTwoSimultaneousMarksLeaveOneCommentAndBothSucceed(t *testing.T) {
 	got := f.repos["acme/app"][0].Comments
 	if len(got) != 1 || got[0].ID != 500 {
 		t.Fatalf("want only the oldest comment (500) to survive, got %+v", got)
+	}
+}
+
+// ---- fold 4 (blind round 3: F1-F7) ----
+
+func commentCfg() *Config {
+	c := &Config{Repositories: []string{"acme/app"}, Comment: true}
+	_ = c.normalize()
+	return c
+}
+
+func TestAMarkThatPostsTheThousandthCommentSucceeds(t *testing.T) { // F1
+	f := newFake(t)
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	for i := 0; i < 999; i++ {
+		is.Comments = append(is.Comments, Comment{ID: int64(i + 1), Body: "chatter"})
+	}
+	mustCall(t, newAdapter(t, f, commentCfg()), "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	marked := 0
+	for _, c := range is.Comments {
+		if markerLine.MatchString(c.Body) {
+			marked++
+		}
+	}
+	if marked != 1 || len(is.Comments) != 1000 {
+		t.Fatalf("marked %d of %d comments", marked, len(is.Comments))
+	}
+}
+
+func TestAWrongCommentAuthorWritesNothing(t *testing.T) { // F2, a token that names its account
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := commentCfg()
+	cfg.CommentAuthor = "someone-else"
+	a := newAdapter(t, f, cfg)
+	if _, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil {
+		t.Fatal("a mismatched commentAuthor was accepted")
+	}
+	if len(f.Writes) != 0 {
+		t.Fatalf("writes: %v", f.Writes)
+	}
+}
+
+func TestAWrongCommentAuthorOnAnInstallationTokenRemovesThePostedComment(t *testing.T) { // F2, no GET /user
+	f := newFake(t)
+	f.Login = "-" // GET /user answers 404, and the fake posts as "-"
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := commentCfg()
+	cfg.CommentAuthor = "wrong-bot"
+	a := newAdapter(t, f, cfg)
+	if _, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil {
+		t.Fatal("a comment posted by another account was accepted")
+	}
+	if len(is.Comments) != 0 {
+		t.Fatalf("the unrecognisable comment was left: %+v", is.Comments)
+	}
+}
+
+func TestAnIssueThatMovedOutOfScopeIsNeitherListedNorNormalized(t *testing.T) { // F3
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	f.Moved = map[string]string{"acme/app": "elsewhere/app"}
+	a := newAdapter(t, f, &Config{Repositories: []string{"acme/app"}})
+	_ = a.Config.normalize()
+	if _, r := call(t, a, "list-untracked", `{}`); r == nil {
+		t.Error("list advertised an issue outside the configured scope")
+	}
+	if _, r := call(t, a, "normalize", `{"reference":"acme/app#1"}`); r == nil {
+		t.Error("normalize named an issue outside the configured scope")
+	}
+}
+
+func TestACheckOfABadSetupStillJudgesTheRequestAndTheConfigSeparately(t *testing.T) { // F5
+	cfg := filepath.Join(t.TempDir(), "c.json")
+	_ = os.WriteFile(cfg, []byte(`{"repositories":["a/b"]}`), 0o600)
+	a := &Adapter{Host: "github.com", ClientError: "GITHUB_API_URL is not usable", CredentialAsked: true}
+	if _, err := a.Handle(context.Background(), "check", strings.NewReader(`not json`)); err == nil {
+		t.Error("a malformed request must be refused even when the setup is bad")
+	}
+	out, err := a.Handle(context.Background(), "check", strings.NewReader(`{"contractVersion":1}`))
+	m := out.(map[string]any)
+	if err != nil || m["configValid"] != false || m["credentialPresent"] != true {
+		t.Fatalf("%v %v", m, err)
+	}
+	a.Config = baseConfig()
+	out, _ = a.Handle(context.Background(), "check", strings.NewReader(`{"contractVersion":1}`))
+	if out.(map[string]any)["configValid"] != true {
+		t.Errorf("a valid config was reported invalid: %v", out)
+	}
+}
+
+func TestAnIncompleteSuccessfulAnswerIsNotAnAnswer(t *testing.T) { // F6
+	for name, body := range map[string]string{"empty": ``, "null": `null`, "no url": `{"number":1,"title":"t","state":"open"}`, "other number": `{"number":2,"html_url":"https://github.com/a/b/issues/2"}`} {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		c := &Client{API: srv.URL, Token: token, HTTP: srv.Client()}
+		if _, err := c.GetIssue(context.Background(), "a/b", 1); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if _, err := c.ListComments(context.Background(), "a/b", 1, 10); err == nil && (name == "empty" || name == "null") {
+			t.Errorf("%s: a blank comment list counted as no comments", name)
+		}
+		srv.Close()
+	}
+}
+
+func TestALabelRemovalThatAnsweredNotFoundIsCheckedAgainstTheIssue(t *testing.T) { // F7
+	serve := func(issue string, status int) *Client {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(issue))
+		}))
+		t.Cleanup(srv.Close)
+		return &Client{API: srv.URL, Token: token, HTTP: srv.Client()}
+	}
+	ctx := context.Background()
+	const absent = `{"number":1,"html_url":"https://github.com/a/b/issues/1","labels":[]}`
+	const present = `{"number":1,"html_url":"https://github.com/a/b/issues/1","labels":[{"name":"tracked"}]}`
+	if err := serve(absent, 200).RemoveLabel(ctx, "a/b", 1, "tracked"); err != nil {
+		t.Errorf("an absent label on a live issue is fine: %v", err)
+	}
+	if err := serve(present, 200).RemoveLabel(ctx, "a/b", 1, "tracked"); err == nil {
+		t.Error("a 404 for a label the issue still carries was taken as success")
+	}
+	if err := serve(`{}`, 404).RemoveLabel(ctx, "a/b", 1, "tracked"); err == nil {
+		t.Error("a 404 on a vanished issue was taken as success")
 	}
 }

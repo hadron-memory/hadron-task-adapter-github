@@ -115,7 +115,7 @@ become spaces, 1,000 bytes at most). Request fields not named below are ignored.
 | `untrack` | `{externalId}` | `{}` |
 | `get` | `{externalId}` | `{externalId, title, body, bodyTruncated, state, url}` (body cut at 64 Ki characters). |
 | `report` | `{externalId, task, state}` | `{}` (states match the config's `report` keys without regard to case; two keys that differ only in case are a config error). |
-| `changed-since` | `{since: RFC 3339, limit?, cursor?}` | `{items: [{externalId, title, state, updatedAt}], nextCursor}` (open and closed, oldest update first). |
+| `changed-since` | `{since: RFC 3339, limit?, cursor?}` | `{items: [{externalId, title, state, updatedAt}], nextCursor}` (open and closed, oldest update first). Each page is read live, so an issue updated between two pages of one traversal can come again on a later page: that is a change, and the consumer deduplicates by `externalId`. |
 | `normalize` | `{reference}` | `{externalId}`: `owner/repo#N`, `#N`, or any issue URL form (http, `www.`, a trailing slash, a query or fragment) to the canonical URL. |
 | `check` | – | `{credentialPresent, credentialValid, reachable, configValid, detail?, configDetail?}`. Always exit 0, and it runs **without a config** (a bad or missing one is `configValid: false` with `configDetail`), because it is how a bad setup is diagnosed. `credentialValid` is true only when GitHub answered the token's request 2xx (a 401, 403, 404 or 500 is not proof); it never prints the token. |
 

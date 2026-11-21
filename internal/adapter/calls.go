@@ -63,6 +63,10 @@ type Adapter struct {
 	// ConfigError is why the config could not be loaded; only `check` runs
 	// without one, and reports it.
 	ConfigError string
+	// ClientError is why the GitHub client could not be built (a bad endpoint
+	// or token); only `check` runs without one, and reports it.
+	ClientError     string
+	CredentialAsked bool
 }
 
 // Handle runs one call: stdin is the request object, the returned value is the
@@ -74,6 +78,9 @@ func (a *Adapter) Handle(ctx context.Context, call string, stdin io.Reader) (any
 	}
 	if call == "describe" {
 		return Describe(), nil // answers without a config or a credential
+	}
+	if call == "check" && a.Client == nil && a.ClientError != "" {
+		return a.checkWithoutClient(), nil // the request was judged above; the setup is reported, not refused
 	}
 	if call == "check" && a.Client != nil {
 		return a.check(ctx) // runs without a (valid) config: it is how a bad setup is diagnosed
@@ -219,6 +226,9 @@ func (a *Adapter) listUntracked(ctx context.Context, q *request) (any, error) {
 	for _, is := range rest {
 		if err := checkExternalID(is.URL); err != nil {
 			return nil, err
+		}
+		if got, _, ok := repoOfIssueURL(is.URL); !ok || !strings.EqualFold(got, is.Repo) {
+			return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s lists an issue that now lives at %s, outside the configured repository; update the config", is.Repo, cleanText(is.URL, 200))}
 		}
 		out.Items = append(out.Items, itemOut{ExternalID: is.URL, Title: cleanText(is.Title, 1024)})
 	}
@@ -517,10 +527,29 @@ func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body st
 		return err
 	}
 	if len(own) == 0 {
-		if err := a.Client.CreateComment(ctx, repo, n, body); err != nil {
+		login, err := a.ownLogin(ctx)
+		if err != nil {
 			return err
 		}
-		if own, err = a.ownComments(ctx, repo, n); err != nil {
+		if a.Config.CommentAuthor != "" { // a wrong commentAuthor would make every retry post another comment
+			if actual, lerr := a.Client.Login(ctx); lerr == nil && !strings.EqualFold(actual, login) {
+				return &Refusal{Code: ExitRefused, Msg: "commentAuthor " + strconv.Quote(cleanText(login, 64)) + " is not the credential's account " + strconv.Quote(cleanText(actual, 64)) + "; nothing was written"}
+			}
+		}
+		created, err := a.Client.CreateComment(ctx, repo, n, body)
+		if err != nil {
+			return err
+		}
+		if created.User.Login != "" && !strings.EqualFold(created.User.Login, login) {
+			_ = a.Client.DeleteComment(ctx, repo, created.ID) // undo: it would not be recognised on a retry
+			return &Refusal{Code: ExitRefused, Msg: "the comment was posted as " + strconv.Quote(cleanText(created.User.Login, 64)) + ", not commentAuthor " + strconv.Quote(cleanText(login, 64)) + "; it was removed. Set commentAuthor to the credential's login"}
+		}
+		own, err = a.ownComments(ctx, repo, n)
+		var lim commentLimit
+		if errors.As(err, &lim) { // the comment list is past the scan bound, but the write is known: GitHub named it
+			own, err = []Comment{created}, nil
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -566,6 +595,9 @@ func (a *Adapter) normalize(ctx context.Context, q *request) (any, error) {
 	}
 	if err := checkExternalID(is.URL); err != nil {
 		return nil, err
+	}
+	if got, _, ok := repoOfIssueURL(is.URL); !ok || !strings.EqualFold(got, repo) {
+		return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d now lives at %s, outside the configured repository", repo, n, cleanText(is.URL, 200))}
 	}
 	return map[string]any{"externalId": is.URL}, nil
 }
@@ -814,9 +846,12 @@ func repoOfIssueURL(raw string) (repo string, n int, ok bool) {
 	return p[len(p)-4] + "/" + p[len(p)-3], n, true
 }
 
-// SetupFailure is check's answer when the client itself could not be built
-// (a bad endpoint or token): the setup is reported, not refused.
-func SetupFailure(token string, err error) map[string]any {
-	return map[string]any{"credentialPresent": token != "", "credentialValid": false, "reachable": false, "configValid": false,
-		"detail": cleanText(ScrubSecret(err.Error(), token), 512)}
+// checkWithoutClient is check's answer when the client could not be built: the
+// setup problem and, independently, whether the config is valid.
+func (a *Adapter) checkWithoutClient() map[string]any {
+	out := map[string]any{"credentialPresent": a.CredentialAsked, "credentialValid": false, "reachable": false, "configValid": a.Config != nil, "detail": cleanText(a.ClientError, 512)}
+	if a.ConfigError != "" {
+		out["configDetail"] = cleanText(a.ConfigError, 512)
+	}
+	return out
 }

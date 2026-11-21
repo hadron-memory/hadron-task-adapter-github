@@ -198,7 +198,7 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request) {
 	}
 	var nodes []node
 	for _, is := range list[start:end] {
-		n := node{Number: is.Number, Title: is.Title, URL: "https://github.com/" + repo + "/issues/" + strconv.Itoa(is.Number), State: is.State, CreatedAt: is.CreatedAt, UpdatedAt: is.UpdatedAt}
+		n := node{Number: is.Number, Title: is.Title, URL: "https://github.com/" + f.shownRepo(repo) + "/issues/" + strconv.Itoa(is.Number), State: is.State, CreatedAt: is.CreatedAt, UpdatedAt: is.UpdatedAt}
 		for _, l := range is.Labels {
 			n.Labels.Nodes = append(n.Labels.Nodes, map[string]string{"name": l})
 		}
@@ -302,7 +302,8 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 		if hi > len(is.Comments) {
 			hi = len(is.Comments)
 		}
-		_ = json.NewEncoder(w).Encode(is.Comments[lo:hi])
+		out := append([]Comment{}, is.Comments[lo:hi]...) // GitHub answers [], never null
+		_ = json.NewEncoder(w).Encode(out)
 	case len(rest) == 1 && rest[0] == "comments" && r.Method == http.MethodPost:
 		f.Writes = append(f.Writes, r.Method+" "+r.URL.Path)
 		var b struct{ Body string }
@@ -311,7 +312,8 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 		c := Comment{ID: f.nextCID, Body: b.Body}
 		c.User.Login = f.Login
 		is.Comments = append(is.Comments, c)
-		_, _ = io.WriteString(w, `{}`)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(c)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}

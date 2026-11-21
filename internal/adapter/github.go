@@ -178,7 +178,10 @@ func (c *Client) do(ctx context.Context, method, endpoint string, body any, out 
 	if resp.StatusCode >= 300 {
 		return resp.StatusCode, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered HTTP %d for %s %s", resp.StatusCode, method, c.scrubURL(endpoint))}
 	}
-	if out != nil && len(bytes.TrimSpace(raw)) > 0 {
+	if out != nil {
+		if t := bytes.TrimSpace(raw); len(t) == 0 || string(t) == "null" { // a read needs its answer: nothing is not "empty"
+			return resp.StatusCode, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered %s %s with no content", method, c.scrubURL(endpoint))}
+		}
 		if err := json.Unmarshal(raw, out); err != nil {
 			return resp.StatusCode, &Refusal{Code: ExitRefused, Msg: "GitHub answered something that is not the expected JSON"}
 		}
@@ -304,6 +307,9 @@ func (c *Client) GetIssue(ctx context.Context, repo string, n int) (Issue, error
 	if err != nil {
 		return Issue{}, err
 	}
+	if r.HTMLURL == "" || r.Number != n {
+		return Issue{}, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub's answer for %s#%d is incomplete (no URL or a different number)", repo, n)}
+	}
 	if r.PR != nil {
 		return Issue{}, &Refusal{Code: ExitUsage, Msg: fmt.Sprintf("%s#%d is a pull request, not an issue", repo, n)}
 	}
@@ -327,6 +333,17 @@ func (c *Client) AddLabels(ctx context.Context, repo string, n int, labels ...st
 func (c *Client) RemoveLabel(ctx context.Context, repo string, n int, label string) error {
 	code, err := c.do(ctx, http.MethodDelete, c.API+issuePath(repo, n)+"/labels/"+url.PathEscape(label), nil, nil)
 	if code == http.StatusNotFound {
+		// A 404 is "the label is not on the issue" only if the issue is still
+		// readable and does not carry it; otherwise the target changed under us.
+		is, gerr := c.GetIssue(ctx, repo, n)
+		if gerr != nil {
+			return gerr
+		}
+		for _, l := range is.Labels {
+			if strings.EqualFold(l, label) {
+				return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("GitHub answered 404 removing the label from %s#%d, which still carries it", repo, n)}
+			}
+		}
 		return nil
 	}
 	return err
@@ -355,8 +372,13 @@ func (c *Client) ListComments(ctx context.Context, repo string, n, pages int) ([
 			return all, nil
 		}
 	}
-	return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has more than %d comments, so the adapter cannot tell whether its own comment exists", repo, n, pages*100)}
+	return nil, commentLimit{&Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has more than %d comments, so the adapter cannot tell whether its own comment exists", repo, n, pages*100)}}
 }
+
+// commentLimit is the refusal for a comment list longer than the scan bound.
+type commentLimit struct{ *Refusal }
+
+func (e commentLimit) Unwrap() error { return e.Refusal }
 
 // DeleteComment deletes a comment by id; one already gone is not an error.
 func (c *Client) DeleteComment(ctx context.Context, repo string, id int64) error {
@@ -383,9 +405,15 @@ func (c *Client) Login(ctx context.Context) (string, error) {
 }
 
 // CreateComment posts a comment.
-func (c *Client) CreateComment(ctx context.Context, repo string, n int, body string) error {
-	_, err := c.do(ctx, http.MethodPost, c.API+issuePath(repo, n)+"/comments", map[string]any{"body": body}, nil)
-	return err
+func (c *Client) CreateComment(ctx context.Context, repo string, n int, body string) (Comment, error) {
+	var created Comment
+	if _, err := c.do(ctx, http.MethodPost, c.API+issuePath(repo, n)+"/comments", map[string]any{"body": body}, &created); err != nil {
+		return Comment{}, err
+	}
+	if created.ID == 0 {
+		return Comment{}, &Refusal{Code: ExitRefused, Msg: "GitHub's answer to the comment does not name it"}
+	}
+	return created, nil
 }
 
 // UpdateComment edits a comment by id.
