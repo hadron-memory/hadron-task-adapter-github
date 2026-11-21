@@ -959,7 +959,7 @@ func TestTheCommentIdentityIsAskedOncePerCallSoNoLookupFollowsAWrite(t *testing.
 		mustCall(t, a, op, req)
 		n, firstUser, firstWrite := 0, -1, -1
 		for i, r := range f.Requests {
-			if strings.HasSuffix(r, " /user") {
+			if r == "GET /user" {
 				n++
 				if firstUser < 0 {
 					firstUser = i
@@ -971,7 +971,7 @@ func TestTheCommentIdentityIsAskedOncePerCallSoNoLookupFollowsAWrite(t *testing.
 		}
 		// Once, and BEFORE the first write: one lookup after the label write also
 		// counts one, which is exactly the original failure.
-		if n != 1 || firstWrite < 0 || firstUser > firstWrite {
+		if n != 1 || firstWrite < 0 || firstUser < 0 || firstUser >= firstWrite {
 			t.Errorf("%s: %d identity lookups (first at %d), first write at %d, want exactly one, before any write: %v", op, n, firstUser, firstWrite, f.Requests)
 		}
 	}
