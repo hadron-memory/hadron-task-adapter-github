@@ -196,7 +196,7 @@ func (f *fakeGitHub) graphql(w http.ResponseWriter, r *http.Request) {
 			PageInfo map[string]bool     `json:"pageInfo"`
 		} `json:"labels"`
 	}
-	var nodes []node
+	nodes := []node{}
 	for _, is := range list[start:end] {
 		n := node{Number: is.Number, Title: is.Title, URL: "https://github.com/" + f.shownRepo(repo) + "/issues/" + strconv.Itoa(is.Number), State: is.State, CreatedAt: is.CreatedAt, UpdatedAt: is.UpdatedAt}
 		for _, l := range is.Labels {

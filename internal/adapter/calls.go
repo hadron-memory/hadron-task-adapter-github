@@ -229,8 +229,8 @@ func (a *Adapter) listUntracked(ctx context.Context, q *request) (any, error) {
 		if err := checkExternalID(is.URL); err != nil {
 			return nil, err
 		}
-		if got, _, ok := repoOfIssueURL(is.URL); !ok || !strings.EqualFold(got, is.Repo) {
-			return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s lists an issue that now lives at %s, outside the configured repository; update the config", is.Repo, cleanText(is.URL, 200))}
+		if err := a.inScope(is); err != nil {
+			return nil, err
 		}
 		out.Items = append(out.Items, itemOut{ExternalID: is.URL, Title: cleanText(is.Title, 1024)})
 	}
@@ -488,6 +488,15 @@ func safeHTTPS(u string) string {
 // commentAuthor, else the token's own login.
 func (a *Adapter) ownLogin(ctx context.Context) (string, error) {
 	if a.Config.CommentAuthor != "" {
+		// Bind the configured identity to the credential on every path that reads
+		// or writes the adapter's comments (create, edit, release, delete): with a
+		// token that names its account the two must agree, or the adapter would
+		// edit another account's marker comments. An installation token names no
+		// account (GET /user is refused), so the configured login is trusted there
+		// and the author of a created comment is checked instead.
+		if actual, lerr := a.Client.Login(ctx); lerr == nil && !strings.EqualFold(actual, a.Config.CommentAuthor) {
+			return "", &Refusal{Code: ExitRefused, Msg: "commentAuthor " + strconv.Quote(cleanText(a.Config.CommentAuthor, 64)) + " is not the credential's account " + strconv.Quote(cleanText(actual, 64)) + "; nothing was changed"}
+		}
 		return a.Config.CommentAuthor, nil
 	}
 	login, err := a.Client.Login(ctx)
@@ -532,11 +541,6 @@ func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body st
 		login, err := a.ownLogin(ctx)
 		if err != nil {
 			return err
-		}
-		if a.Config.CommentAuthor != "" { // a wrong commentAuthor would make every retry post another comment
-			if actual, lerr := a.Client.Login(ctx); lerr == nil && !strings.EqualFold(actual, login) {
-				return &Refusal{Code: ExitRefused, Msg: "commentAuthor " + strconv.Quote(cleanText(login, 64)) + " is not the credential's account " + strconv.Quote(cleanText(actual, 64)) + "; nothing was written"}
-			}
 		}
 		created, err := a.Client.CreateComment(ctx, repo, n, body)
 		if err != nil {
@@ -584,6 +588,9 @@ func (a *Adapter) get(ctx context.Context, q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := a.inScope(is); err != nil {
+		return nil, err
+	}
 	body, truncated := truncateRunes(is.Body, maxBodyRunes)
 	return map[string]any{"externalId": is.URL, "title": cleanText(is.Title, 1024), "body": body, "bodyTruncated": truncated, "state": is.State, "url": is.URL}, nil
 }
@@ -602,8 +609,8 @@ func (a *Adapter) normalize(ctx context.Context, q *request) (any, error) {
 	if err := checkExternalID(is.URL); err != nil {
 		return nil, err
 	}
-	if got, _, ok := repoOfIssueURL(is.URL); !ok || !strings.EqualFold(got, repo) {
-		return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d now lives at %s, outside the configured repository", repo, n, cleanText(is.URL, 200))}
+	if err := a.inScope(is); err != nil {
+		return nil, err
 	}
 	return map[string]any{"externalId": is.URL}, nil
 }
@@ -683,6 +690,9 @@ func (a *Adapter) changedSince(ctx context.Context, q *request) (any, error) {
 		NextCursor *string   `json:"nextCursor"`
 	}{Items: make([]changed, 0, len(rest))}
 	for _, is := range rest {
+		if err := a.inScope(is); err != nil {
+			return nil, err
+		}
 		out.Items = append(out.Items, changed{ExternalID: is.URL, Title: cleanText(is.Title, 1024), State: is.State, UpdatedAt: is.UpdatedAt})
 	}
 	if more {
@@ -860,4 +870,15 @@ func (a *Adapter) checkWithoutClient() map[string]any {
 		out["configDetail"] = cleanText(ScrubSecret(a.ConfigError, a.Secret), 512)
 	}
 	return out
+}
+
+// inScope refuses an issue whose own URL is not on the configured host and
+// repository (GitHub resolved a moved or renamed repository, or answered a
+// different issue): such an issue is neither shown nor written.
+func (a *Adapter) inScope(is Issue) error {
+	repo, n, ok := a.issueFromURL(is.URL)
+	if !ok || n != is.Number || !strings.EqualFold(repo, is.Repo) || !a.Config.inRepositories(repo) {
+		return &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d is at %s, outside the configured repositories; update the config", is.Repo, is.Number, cleanText(is.URL, 200))}
+	}
+	return nil
 }

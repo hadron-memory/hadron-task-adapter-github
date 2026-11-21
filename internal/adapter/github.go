@@ -101,10 +101,15 @@ func checkEndpoint(raw string) error {
 	if u.User != nil {
 		return errors.New("it must not carry userinfo")
 	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return errors.New("it must be a base URL without a query or fragment")
+	}
 	return nil
 }
 
-// sameOriginHTTPS refuses a redirect that leaves https or the first request's host.
+// sameOriginHTTPS refuses a redirect that leaves https or the first request's
+// host, and any redirect of a request that is not a GET (this includes the
+// read-only GraphQL POST: it is never replayed).
 func sameOriginHTTPS(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
 		return errors.New("too many redirects")
@@ -240,9 +245,9 @@ func (c *Client) ReadIssues(ctx context.Context, repo string, states []string, s
 		var resp struct {
 			Data struct {
 				Repository *struct {
-					Issues struct {
-						PageInfo struct {
-							HasNextPage bool    `json:"hasNextPage"`
+					Issues *struct {
+						PageInfo *struct {
+							HasNextPage *bool   `json:"hasNextPage"`
 							EndCursor   *string `json:"endCursor"`
 						} `json:"pageInfo"`
 						Nodes []rawIssue `json:"nodes"`
@@ -263,6 +268,11 @@ func (c *Client) ReadIssues(ctx context.Context, repo string, states []string, s
 			return nil, &Refusal{Code: ExitRefused, Msg: repo + " was not found or the credential cannot read it"}
 		}
 		is := resp.Data.Repository.Issues
+		// An absent connection, page info or node list is an incomplete answer,
+		// never an empty result.
+		if is == nil || is.PageInfo == nil || is.PageInfo.HasNextPage == nil || is.Nodes == nil {
+			return nil, &Refusal{Code: ExitRefused, Msg: "GitHub's issues answer for " + repo + " is incomplete"}
+		}
 		for _, n := range is.Nodes {
 			if n.Labels.PageInfo.HasNextPage {
 				return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has more than %d labels, so its filters cannot be decided", repo, n.Number, labelsPerIssue)}
@@ -273,7 +283,7 @@ func (c *Client) ReadIssues(ctx context.Context, repo string, states []string, s
 			}
 			out = append(out, Issue{Repo: repo, Number: n.Number, Title: n.Title, URL: n.URL, State: strings.ToLower(n.State), CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt, Labels: labels})
 		}
-		if !is.PageInfo.HasNextPage {
+		if !*is.PageInfo.HasNextPage {
 			return out, nil
 		}
 		if is.PageInfo.EndCursor == nil {

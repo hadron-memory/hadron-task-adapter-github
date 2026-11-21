@@ -626,3 +626,78 @@ func TestCheckWithoutAClientNeverPrintsTheTokenInEitherDetail(t *testing.T) {
 		t.Fatalf("%v %s", err, b)
 	}
 }
+
+// ---- fold 6 (blind round 4: F1 P1, F3-F5) ----
+
+func TestAConfiguredIdentityThatIsNotTheCredentialsEditsAndReleasesNothing(t *testing.T) { // F1
+	f := newFake(t)
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	other := Comment{ID: 7, Body: trackedComment(taskIn{ID: "t-1"}, workerIn{Name: "Iris"})}
+	other.User.Login = "someone-else"
+	is.Comments = []Comment{other}
+	cfg := &Config{Repositories: []string{"acme/app"}, Comment: true, CommentAuthor: "someone-else"}
+	_ = cfg.normalize()
+	a := newAdapter(t, f, cfg)
+	before := is.Comments[0].Body
+	if _, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil {
+		t.Error("mark-tracked edited another account's comment")
+	}
+	if _, r := call(t, a, "untrack", `{"externalId":"`+issueURL("acme/app", 1)+`"}`); r == nil {
+		t.Error("untrack released another account's comment")
+	}
+	if is.Comments[0].Body != before || len(f.Writes) != 0 {
+		t.Fatalf("something was written: %v %q", f.Writes, is.Comments[0].Body)
+	}
+}
+
+func TestGetAndChangedSinceRefuseAnIssueOutsideTheConfiguredScope(t *testing.T) { // F3
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-02T00:00:00Z"})
+	f.Moved = map[string]string{"acme/app": "elsewhere/app"}
+	a := newAdapter(t, f, &Config{Repositories: []string{"acme/app"}})
+	_ = a.Config.normalize()
+	if _, r := call(t, a, "get", `{"externalId":"`+issueURL("acme/app", 1)+`"}`); r == nil {
+		t.Error("get returned an issue outside the configured scope")
+	}
+	if _, r := call(t, a, "changed-since", `{"since":"2025-01-01T00:00:00Z"}`); r == nil {
+		t.Error("changed-since returned an issue outside the configured scope")
+	}
+}
+
+func TestAnIncompleteGraphQLAnswerIsNotAnEmptyResult(t *testing.T) { // F4
+	for name, body := range map[string]string{
+		"no issues":    `{"data":{"repository":{}}}`,
+		"no page info": `{"data":{"repository":{"issues":{"nodes":[]}}}}`,
+		"no nodes":     `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false}}}}}`,
+		"null nodes":   `{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false},"nodes":null}}}}`,
+		"no hasNext":   `{"data":{"repository":{"issues":{"pageInfo":{},"nodes":[]}}}}`,
+	} {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		c := &Client{API: srv.URL, GraphQL: srv.URL, Token: token, HTTP: srv.Client()}
+		if got, err := c.ReadIssues(context.Background(), "a/b", []string{"OPEN"}, "", 5); err == nil {
+			t.Errorf("%s: accepted as %v", name, got)
+		}
+		srv.Close()
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}`))
+	}))
+	defer srv.Close()
+	c := &Client{API: srv.URL, GraphQL: srv.URL, Token: token, HTTP: srv.Client()}
+	if got, err := c.ReadIssues(context.Background(), "a/b", []string{"OPEN"}, "", 5); err != nil || len(got) != 0 {
+		t.Errorf("a complete empty page is fine: %v %v", got, err)
+	}
+}
+
+func TestAnEndpointWithAQueryOrFragmentIsRefused(t *testing.T) { // F5
+	for _, u := range []string{"https://ghe.example.com/api/v3?x=1", "https://ghe.example.com/api/v3#f", "https://ghe.example.com/api/v3?"} {
+		if _, err := NewClient(func(k string) string {
+			if k == "GITHUB_API_URL" {
+				return u
+			}
+			return ""
+		}); err == nil {
+			t.Errorf("%s accepted", u)
+		}
+	}
+}
