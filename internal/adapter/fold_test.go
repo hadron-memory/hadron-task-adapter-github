@@ -291,15 +291,20 @@ func TestMalformedRequestsAreRefusedBeforeAnyAction(t *testing.T) {
 func TestCheckNeedsAffirmativeEvidenceOfAnAcceptedCredential(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status       int
+		login        string
 		valid, reach bool
 	}{
-		"ok":  {0, true, true},
-		"404": {404, false, true},
-		"500": {500, false, true},
-		"401": {401, false, true},
-		"403": {403, false, true},
+		"ok":                                 {0, "", true, true},
+		"404 and the account is readable":    {404, "", true, true}, // GHES with rate limiting off: judged by GET /user
+		"404 and the credential has no user": {404, "-", false, true},
+		"500":                                {500, "", false, true},
+		"401":                                {401, "", false, true},
+		"403":                                {403, "", false, true},
 	} {
 		f := newFake(t)
+		if tc.login != "" {
+			f.Login = tc.login
+		}
 		f.RateLimitStatus = tc.status
 		a := &Adapter{Config: baseConfig(), Client: f.client(token)}
 		m := mustCall(t, a, "check", `{}`)
@@ -880,5 +885,60 @@ func TestALeadWithSpacesInTheConfigMatchesTheRequest(t *testing.T) { // F7
 	}
 	if l, ok := c.teamLabelFor("Iris"); !ok || l != "team-a" {
 		t.Fatalf("%q %v", l, ok)
+	}
+}
+
+// ---- fold 9 (blind round 7: F1, F2 P2 and cheap P3s) ----
+
+func TestACommentScanThatCannotCompleteRefusesBeforeAnyLabelWrite(t *testing.T) { // F1
+	for _, op := range []string{"mark-tracked", "untrack"} {
+		f := newFake(t)
+		is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
+		for i := 0; i < 1000; i++ {
+			is.Comments = append(is.Comments, Comment{ID: int64(i + 1), Body: "chatter"})
+		}
+		cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true}
+		_ = cfg.normalize()
+		a := newAdapter(t, f, cfg)
+		req := markRequest(issueURL("acme/app", 1))
+		if op == "untrack" {
+			req = `{"externalId":"` + issueURL("acme/app", 1) + `"}`
+		}
+		if _, r := call(t, a, op, req); r == nil {
+			t.Errorf("%s: a scan that cannot complete was accepted", op)
+		}
+		if len(f.Writes) != 0 {
+			t.Errorf("%s wrote before refusing: %v", op, f.Writes)
+		}
+	}
+}
+
+func TestALoginFailureIsNotAdvisedAsAMissingCommentAuthor(t *testing.T) { // F6
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	a := newAdapter(t, f, commentCfg())
+	f.FailNext["GET /user"] = true
+	_, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if r == nil || strings.Contains(r.Msg, "set commentAuthor") || !strings.Contains(r.Msg, "retry") {
+		t.Fatalf("an outage must say retry, not 'set commentAuthor': %v", r)
+	}
+	f2 := newFake(t)
+	f2.Login = "-"
+	f2.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	a2 := newAdapter(t, f2, commentCfg())
+	if _, r := call(t, a2, "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil || !strings.Contains(r.Msg, "set commentAuthor") {
+		t.Fatalf("no account must say set commentAuthor: %v", r)
+	}
+}
+
+func TestLabelsAreTrimmedAndDotRepositoriesRefused(t *testing.T) { // F15, F16
+	c := &Config{Repositories: []string{"a/b"}, ExcludeLabels: []string{" wontfix "}, ReadyLabel: " ready ", TrackedLabel: " tracked "}
+	if err := c.normalize(); err != nil || c.ExcludeLabels[0] != "wontfix" || c.ReadyLabel != "ready" || c.TrackedLabel != "tracked" {
+		t.Fatalf("%v %+v", err, c)
+	}
+	for _, r := range []string{"./b", "a/.", "../b", "a/.."} {
+		if validRepo(r) {
+			t.Errorf("%q accepted", r)
+		}
 	}
 }

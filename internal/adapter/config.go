@@ -130,7 +130,9 @@ func (c *Config) normalize() error {
 		if strings.TrimSpace(l) == "" {
 			return fmt.Errorf("excludeLabels[%d] is blank", i)
 		}
+		c.ExcludeLabels[i] = strings.TrimSpace(l) // a stray space would silently never match
 	}
+	c.ReadyLabel, c.TrackedLabel = strings.TrimSpace(c.ReadyLabel), strings.TrimSpace(c.TrackedLabel)
 	if c.RequireReady && strings.TrimSpace(c.ReadyLabel) == "" {
 		return errors.New("requireReady needs a readyLabel")
 	}
@@ -198,7 +200,7 @@ func (c *Config) inRepositories(repo string) bool {
 
 func validRepo(r string) bool {
 	owner, name, ok := strings.Cut(r, "/")
-	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") || owner == "." || owner == ".." || name == "." || name == ".." {
 		return false
 	}
 	for _, s := range []string{owner, name} {

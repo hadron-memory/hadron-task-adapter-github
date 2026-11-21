@@ -384,8 +384,8 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if a.Config.Comment { // resolve the comment identity before ANY write, so a refusal changes nothing
-		if _, err := a.ownLogin(ctx); err != nil {
+	if a.Config.Comment { // read everything a refusal could come from before ANY write, so a refusal changes nothing
+		if _, err := a.ownComments(ctx, repo, n); err != nil { // identity, and a comment list the scan can complete
 			return nil, err
 		}
 	}
@@ -416,8 +416,8 @@ func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if a.Config.Comment { // identity first: a refusal must not leave the label removed
-		if _, err := a.ownLogin(ctx); err != nil {
+	if a.Config.Comment { // identity and the comment scan first: a refusal must not leave the label removed
+		if _, err := a.ownComments(ctx, repo, n); err != nil {
 			return nil, err
 		}
 	}
@@ -519,8 +519,11 @@ func (a *Adapter) ownLogin(ctx context.Context) (string, error) {
 		return a.Config.CommentAuthor, nil
 	}
 	login, err := a.Client.Login(ctx)
-	if err != nil {
+	if errors.Is(err, ErrNoIdentity) {
 		return "", &Refusal{Code: ExitRefused, Msg: "comment needs to know which comments are the adapter's own, and GET /user did not name the token's account; set commentAuthor in the config (for a GitHub App installation token, its bot login)"}
+	}
+	if err != nil { // a failure to ask is not "this credential has no account": no config advice
+		return "", &Refusal{Code: ExitRefused, Msg: "could not read the credential's account (" + cleanText(a.Client.scrub(err.Error()), 200) + "); nothing was changed, retry"}
 	}
 	return login, nil
 }
@@ -868,24 +871,6 @@ func truncateRunes(s string, max int) (string, bool) {
 	}
 	r := []rune(s)
 	return string(r[:max]), true
-}
-
-// repoOfIssueURL reads "owner/name" and the number out of an issue's web URL
-// (https://host/owner/name/issues/N).
-func repoOfIssueURL(raw string) (repo string, n int, ok bool) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", 0, false
-	}
-	p := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(p) < 4 || p[len(p)-2] != "issues" {
-		return "", 0, false
-	}
-	n, err = strconv.Atoi(p[len(p)-1])
-	if err != nil {
-		return "", 0, false
-	}
-	return p[len(p)-4] + "/" + p[len(p)-3], n, true
 }
 
 // checkWithoutClient is check's answer when the client could not be built: the

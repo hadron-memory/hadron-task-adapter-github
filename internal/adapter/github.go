@@ -392,7 +392,7 @@ func (c *Client) ListComments(ctx context.Context, repo string, n, pages int) ([
 			return all, nil
 		}
 	}
-	return nil, commentLimit{&Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has more than %d comments, so the adapter cannot tell whether its own comment exists", repo, n, pages*100)}}
+	return nil, commentLimit{&Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has %d or more comments, so the adapter cannot tell whether its own comment exists", repo, n, pages*100)}}
 }
 
 // commentLimit is the refusal for a comment list longer than the scan bound.
@@ -492,6 +492,20 @@ func (c *Client) Ping(ctx context.Context) (reachable, accepted bool, err error)
 		return true, false, nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return true, c.Token != "", nil
+	case resp.StatusCode == http.StatusNotFound && c.Token != "":
+		// GitHub Enterprise Server answers /rate_limit with 404 when rate limiting
+		// is disabled: the credential is then judged by who it says it is.
+		_, err := c.do(ctx, http.MethodGet, c.API+"/user", nil, &struct {
+			Login string `json:"login"`
+		}{})
+		var se statusError
+		switch {
+		case err == nil:
+			return true, true, nil
+		case errors.As(err, &se) && se.Status == http.StatusUnauthorized:
+			return true, false, nil
+		}
+		return true, false, errors.New("GitHub has no /rate_limit here and the credential could not be checked another way")
 	}
 	return true, false, fmt.Errorf("GitHub answered HTTP %d", resp.StatusCode)
 }

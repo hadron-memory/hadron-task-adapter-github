@@ -94,7 +94,7 @@ both) in a listed repository that exists, so a missing item is an error, not an
 (the label set, the comment not), the CLI keeps the claim and reports the failed
 mark, and running `mark-tracked` again completes it. Two simultaneous marks end
 with exactly one adapter comment (the oldest is kept and the adapter's own extras
-are deleted). The comment scan reads at most 1,000 comments; past that it refuses
+are deleted). The comment scan completes only below 1,000 comments; at 1,000 or more it refuses
 rather than guess the adapter has none.
 
 ## The calls
