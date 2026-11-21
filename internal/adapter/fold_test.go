@@ -957,23 +957,33 @@ func TestTheCommentIdentityIsAskedOncePerCallSoNoLookupFollowsAWrite(t *testing.
 			req = `{"externalId":"` + issueURL("acme/app", 1) + `"}`
 		}
 		mustCall(t, a, op, req)
-		n := 0
-		for _, r := range f.Requests {
+		n, firstUser, firstWrite := 0, -1, -1
+		for i, r := range f.Requests {
 			if strings.HasSuffix(r, " /user") {
 				n++
+				if firstUser < 0 {
+					firstUser = i
+				}
+			}
+			if firstWrite < 0 && (strings.HasPrefix(r, "POST ") || strings.HasPrefix(r, "PATCH ") || strings.HasPrefix(r, "DELETE ") || strings.HasPrefix(r, "PUT ")) {
+				firstWrite = i
 			}
 		}
-		if n != 1 {
-			t.Errorf("%s asked GitHub who the credential is %d times (%v), want once, before any write", op, n, f.Requests)
+		// Once, and BEFORE the first write: one lookup after the label write also
+		// counts one, which is exactly the original failure.
+		if n != 1 || firstWrite < 0 || firstUser > firstWrite {
+			t.Errorf("%s: %d identity lookups (first at %d), first write at %d, want exactly one, before any write: %v", op, n, firstUser, firstWrite, f.Requests)
 		}
 	}
 }
 
+// (For the label-then-refuse scenario with a failing GET /user, see
+// TestIdentityIsResolvedBeforeAnyLabelWrite: label+comment, mark and untrack, zero writes.)
 func TestACommentScanJustBelowTheBoundStillMarksAndUntracksWithTheLabel(t *testing.T) { // F4 control
 	for _, op := range []string{"mark-tracked", "untrack"} {
 		f := newFake(t)
 		is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
-		for i := 0; i < 998; i++ {
+		for i := 0; i < 999; i++ { // 999 existing: the edge just below the 1,000 bound
 			is.Comments = append(is.Comments, Comment{ID: int64(i + 1), Body: "chatter"})
 		}
 		cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true}
