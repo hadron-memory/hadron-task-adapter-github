@@ -505,7 +505,11 @@ func (c *Client) Ping(ctx context.Context) (reachable, accepted bool, err error)
 		case errors.As(err, &se) && se.Status == http.StatusUnauthorized:
 			return true, false, nil
 		}
-		return true, false, errors.New("GitHub has no /rate_limit here and the credential could not be checked another way")
+		cause := "the credential could not be checked another way"
+		if err != nil {
+			cause = "GET /user answered: " + c.scrub(err.Error())
+		}
+		return true, false, errors.New("GitHub answered 404 for /rate_limit (rate limiting is off, or GITHUB_API_URL is not the API base) and " + cause)
 	}
 	return true, false, fmt.Errorf("GitHub answered HTTP %d", resp.StatusCode)
 }

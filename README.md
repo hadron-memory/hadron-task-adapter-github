@@ -92,7 +92,7 @@ GitHub. When they do write, they first read the item and refuse unless it is an
 both) in a listed repository that exists, so a missing item is an error, not an
 "absent label". The writes are idempotent: if one fails after another succeeded
 (the label set, the comment not), the CLI keeps the claim and reports the failed
-mark, and running `mark-tracked` again completes it. Two simultaneous marks end
+mark, and running `mark-tracked` again completes it (the exception is an issue with 1,000 or more comments: there `mark-tracked` and `untrack` refuse before changing anything, label included, and rerunning does not help). Two simultaneous marks end
 with exactly one adapter comment (the oldest is kept and the adapter's own extras
 are deleted). The comment scan completes only below 1,000 comments; at 1,000 or more it refuses
 rather than guess the adapter has none.

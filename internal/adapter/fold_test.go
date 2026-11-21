@@ -942,3 +942,63 @@ func TestLabelsAreTrimmedAndDotRepositoriesRefused(t *testing.T) { // F15, F16
 		}
 	}
 }
+
+// ---- fold 10 (blind delta round: F1 P2 honesty, F3 P2 cause, F4 P2 control) ----
+
+func TestTheCommentIdentityIsAskedOncePerCallSoNoLookupFollowsAWrite(t *testing.T) { // F1
+	for _, op := range []string{"mark-tracked", "untrack"} {
+		f := newFake(t)
+		f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+		cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true}
+		_ = cfg.normalize()
+		a := newAdapter(t, f, cfg)
+		req := markRequest(issueURL("acme/app", 1))
+		if op == "untrack" {
+			req = `{"externalId":"` + issueURL("acme/app", 1) + `"}`
+		}
+		mustCall(t, a, op, req)
+		n := 0
+		for _, r := range f.Requests {
+			if strings.HasSuffix(r, " /user") {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s asked GitHub who the credential is %d times (%v), want once, before any write", op, n, f.Requests)
+		}
+	}
+}
+
+func TestACommentScanJustBelowTheBoundStillMarksAndUntracksWithTheLabel(t *testing.T) { // F4 control
+	for _, op := range []string{"mark-tracked", "untrack"} {
+		f := newFake(t)
+		is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+		for i := 0; i < 998; i++ {
+			is.Comments = append(is.Comments, Comment{ID: int64(i + 1), Body: "chatter"})
+		}
+		cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true}
+		_ = cfg.normalize()
+		a := newAdapter(t, f, cfg)
+		req := markRequest(issueURL("acme/app", 1))
+		if op == "untrack" {
+			req = `{"externalId":"` + issueURL("acme/app", 1) + `"}`
+			is.Labels = []string{"hadron-tracked"}
+		}
+		mustCall(t, a, op, req)
+		if len(f.Writes) == 0 {
+			t.Errorf("%s: below the bound it must write", op)
+		}
+	}
+}
+
+func TestCheckSaysWhyWhen404OnRateLimitAndTheUserLookupFailsToo(t *testing.T) { // F3
+	f := newFake(t)
+	f.Login = "-"
+	f.RateLimitStatus = 404
+	a := &Adapter{Config: baseConfig(), Client: f.client(token)}
+	m := mustCall(t, a, "check", `{}`)
+	d, _ := m["detail"].(string)
+	if m["credentialValid"] != false || !strings.Contains(d, "/rate_limit") || !strings.Contains(d, "GET /user answered") || !strings.Contains(d, "GITHUB_API_URL") {
+		t.Fatalf("%v", m)
+	}
+}

@@ -69,6 +69,10 @@ type Adapter struct {
 	CredentialAsked bool
 	// Secret is the credential, so what check prints without a client is scrubbed too.
 	Secret string
+
+	// ownLoginCache holds the comment identity once it is resolved in this
+	// invocation, so a later step never asks GitHub again after a write.
+	ownLoginCache string
 }
 
 // Handle runs one call: stdin is the request object, the returned value is the
@@ -500,6 +504,17 @@ func safeHTTPS(u string) string {
 // ownLogin is the account whose comments the adapter may edit: the config's
 // commentAuthor, else the token's own login.
 func (a *Adapter) ownLogin(ctx context.Context) (string, error) {
+	if a.ownLoginCache != "" {
+		return a.ownLoginCache, nil
+	}
+	login, err := a.resolveOwnLogin(ctx)
+	if err == nil {
+		a.ownLoginCache = login
+	}
+	return login, err
+}
+
+func (a *Adapter) resolveOwnLogin(ctx context.Context) (string, error) {
 	if a.Config.CommentAuthor != "" {
 		// Bind the configured identity to the credential on every path that reads
 		// or writes the adapter's comments (create, edit, release, delete): with a
