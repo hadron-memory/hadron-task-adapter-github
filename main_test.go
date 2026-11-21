@@ -120,3 +120,23 @@ func TestTheCredentialNeverReachesStderr(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckAnswersWhenTheClientCannotBeBuilt(t *testing.T) {
+	code, out, errText := runCall(t, map[string]string{"GITHUB_TOKEN": "ghp_testtoken", "GITHUB_API_URL": "http://x.example/ghp_testtoken"}, []string{"check"}, `{"contractVersion":1}`)
+	if code != 0 || errText != "" || !strings.Contains(out, `"configValid":false`) || !strings.Contains(out, `"credentialPresent":true`) || strings.Contains(out, "ghp_testtoken") {
+		t.Fatalf("%d %q %q", code, out, errText)
+	}
+}
+
+func TestAnUnknownCallIsAUsageErrorBeforeAnySetup(t *testing.T) {
+	code, _, _ := runCall(t, map[string]string{"GITHUB_API_URL": "http://bad"}, []string{"frobnicate"}, `{"contractVersion":1}`)
+	if code != 2 {
+		t.Fatalf("want exit 2, got %d", code)
+	}
+}
+
+func TestTheHTTPRefusalNamesTheAPIURLEveryTime(t *testing.T) {
+	for i := 0; i < 30; i++ {
+		TestAPlainHTTPEndpointIsRefusedBeforeAnyRequest(t)
+	}
+}

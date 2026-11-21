@@ -49,7 +49,8 @@ func NewClient(getenv func(string) string) (*Client, error) {
 			gql = strings.TrimSuffix(api, "/v3") + "/graphql"
 		}
 	}
-	for name, u := range map[string]string{"GITHUB_API_URL": api, "GITHUB_GRAPHQL_URL": gql} {
+	for _, e := range []struct{ name, u string }{{"GITHUB_API_URL", api}, {"GITHUB_GRAPHQL_URL", gql}} { // a fixed order: the refusal names the same one every run
+		name, u := e.name, e.u
 		if err := checkEndpoint(u); err != nil {
 			return nil, &Refusal{Code: ExitRefused, Msg: name + " is not usable: " + err.Error()}
 		}
@@ -107,6 +108,9 @@ func checkEndpoint(raw string) error {
 func sameOriginHTTPS(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
 		return errors.New("too many redirects")
+	}
+	if via[0].Method != http.MethodGet {
+		return errors.New("a redirect on a write is refused, so a write is never replayed as a read")
 	}
 	if req.URL.Scheme != "https" {
 		return errors.New("a redirect to a non-https URL is refused")

@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -24,10 +26,17 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 		return adapter.ExitUsage
 	}
 	call := args[0]
+	if !slices.Contains(adapter.Calls, call) { // before any setup: a wrong call is a usage error whatever the environment holds
+		fmt.Fprintln(stderr, "unknown call "+strconv.Quote(oneLine(call, 60))+"; the calls are "+strings.Join(adapter.Calls, ", "))
+		return adapter.ExitUsage
+	}
 	a := &adapter.Adapter{Host: hostOf(getenv("GITHUB_SERVER_URL"))}
 	if call != "describe" {
 		client, err := adapter.NewClient(getenv)
 		if err != nil {
+			if call == "check" { // check is how a bad setup is diagnosed: answer, do not refuse
+				return answer(stdout, stderr, adapter.SetupFailure(getenv("GITHUB_TOKEN"), err), getenv("GITHUB_TOKEN"))
+			}
 			return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 		}
 		a.Client = client
@@ -47,8 +56,12 @@ func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) stri
 	if err != nil {
 		return refuse(stderr, err, getenv("GITHUB_TOKEN"))
 	}
+	return answer(stdout, stderr, out, getenv("GITHUB_TOKEN"))
+}
+
+func answer(stdout, stderr *os.File, out any, token string) int {
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
-		return refuse(stderr, err, getenv("GITHUB_TOKEN"))
+		return refuse(stderr, err, token)
 	}
 	return 0
 }

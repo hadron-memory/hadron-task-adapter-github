@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,7 +101,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("the config %s is not valid: %w", path, err)
 	}
-	if dec.More() {
+	if _, err := dec.Token(); err != io.EOF {
 		return nil, fmt.Errorf("the config %s has text after its JSON object", path)
 	}
 	if err := c.normalize(); err != nil {

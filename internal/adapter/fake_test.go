@@ -49,6 +49,9 @@ type fakeGitHub struct {
 	FailNext map[string]bool
 	// RateLimitStatus overrides /rate_limit's status when non-zero.
 	RateLimitStatus int
+	// Moved makes an issue lookup report another repository in its html_url,
+	// as GitHub does for a renamed or transferred repository.
+	Moved map[string]string
 }
 
 func newFake(t *testing.T) *fakeGitHub {
@@ -221,6 +224,11 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 		for _, is := range f.repos[repo] {
 			for i := range is.Comments {
 				if is.Comments[i].ID == id {
+					if r.Method == http.MethodDelete {
+						is.Comments = append(is.Comments[:i], is.Comments[i+1:]...)
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
 					is.Comments[i].Body = b.Body
 					_, _ = io.WriteString(w, `{}`)
 					return
@@ -247,7 +255,7 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 		type lab struct {
 			Name string `json:"name"`
 		}
-		o := map[string]any{"number": is.Number, "title": is.Title, "html_url": "https://github.com/" + repo + "/issues/" + parts[4], "state": strings.ToLower(is.State), "body": is.Body, "created_at": is.CreatedAt, "updated_at": is.UpdatedAt}
+		o := map[string]any{"number": is.Number, "title": is.Title, "html_url": "https://github.com/" + f.shownRepo(repo) + "/issues/" + parts[4], "state": strings.ToLower(is.State), "body": is.Body, "created_at": is.CreatedAt, "updated_at": is.UpdatedAt}
 		var ls []lab
 		for _, l := range is.Labels {
 			ls = append(ls, lab{l})
@@ -307,4 +315,11 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func (f *fakeGitHub) shownRepo(repo string) string {
+	if m, ok := f.Moved[repo]; ok {
+		return m
+	}
+	return repo
 }

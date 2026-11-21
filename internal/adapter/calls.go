@@ -32,6 +32,8 @@ const (
 
 // markerLine is the first line of a comment the adapter owns: the marker, a
 // task id (or "released") and the closing. Anything else is someone's text.
+var markerID = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
 var markerLine = regexp.MustCompile(`^<!-- hadron-task:([A-Za-z0-9._:-]{1,128}|released) -->(\n|$)`)
 
 // Exit codes. The CLI treats every non-zero exit as the adapter's refusal and
@@ -66,12 +68,12 @@ type Adapter struct {
 // Handle runs one call: stdin is the request object, the returned value is the
 // single answer object. A *Refusal carries the exit code.
 func (a *Adapter) Handle(ctx context.Context, call string, stdin io.Reader) (any, error) {
-	if call == "describe" {
-		return Describe(), nil // answers without a config or a credential
-	}
 	req, err := decodeRequest(stdin)
 	if err != nil {
 		return nil, err
+	}
+	if call == "describe" {
+		return Describe(), nil // answers without a config or a credential
 	}
 	if call == "check" && a.Client != nil {
 		return a.check(ctx) // runs without a (valid) config: it is how a bad setup is diagnosed
@@ -331,8 +333,14 @@ func (a *Adapter) writeTarget(ctx context.Context, externalID string) (string, i
 	if err != nil {
 		return "", 0, err
 	}
-	if _, err := a.Client.GetIssue(ctx, repo, n); err != nil {
+	is, err := a.Client.GetIssue(ctx, repo, n)
+	if err != nil {
 		return "", 0, err
+	}
+	// GitHub follows a moved or renamed repository: write only to the issue the
+	// lookup really resolved, and only if it is still one the config lists.
+	if got, gn, ok := repoOfIssueURL(is.URL); !ok || gn != n || !strings.EqualFold(got, repo) {
+		return "", 0, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d now resolves to %s, which is not the listed repository; it is not written", repo, n, cleanText(is.URL, 200))}
 	}
 	return repo, n, nil
 }
@@ -341,6 +349,9 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 	var task taskIn
 	if len(q.Task) == 0 || json.Unmarshal(q.Task, &task) != nil || task.ID == "" {
 		return nil, &Refusal{Code: ExitUsage, Msg: "mark-tracked needs the task (its id)"}
+	}
+	if !markerID.MatchString(task.ID) { // before any write: a comment the reader cannot recognise would be created again on every retry
+		return nil, &Refusal{Code: ExitUsage, Msg: "the task id has characters a tracked marker cannot hold (letters, digits and . _ : - only, up to 128)"}
 	}
 	var worker workerIn
 	if len(q.Worker) != 0 && string(q.Worker) != "null" {
@@ -566,7 +577,7 @@ func (a *Adapter) check(ctx context.Context) (any, error) {
 		out["detail"] = cleanText(a.Client.scrub(err.Error()), 512)
 	}
 	if a.ConfigError != "" {
-		out["configDetail"] = cleanText(a.ConfigError, 512)
+		out["configDetail"] = cleanText(a.Client.scrub(a.ConfigError), 512)
 	}
 	return out, nil
 }
@@ -783,4 +794,29 @@ func truncateRunes(s string, max int) (string, bool) {
 	}
 	r := []rune(s)
 	return string(r[:max]), true
+}
+
+// repoOfIssueURL reads "owner/name" and the number out of an issue's web URL
+// (https://host/owner/name/issues/N).
+func repoOfIssueURL(raw string) (repo string, n int, ok bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", 0, false
+	}
+	p := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(p) < 4 || p[len(p)-2] != "issues" {
+		return "", 0, false
+	}
+	n, err = strconv.Atoi(p[len(p)-1])
+	if err != nil {
+		return "", 0, false
+	}
+	return p[len(p)-4] + "/" + p[len(p)-3], n, true
+}
+
+// SetupFailure is check's answer when the client itself could not be built
+// (a bad endpoint or token): the setup is reported, not refused.
+func SetupFailure(token string, err error) map[string]any {
+	return map[string]any{"credentialPresent": token != "", "credentialValid": false, "reachable": false, "configValid": false,
+		"detail": cleanText(ScrubSecret(err.Error(), token), 512)}
 }

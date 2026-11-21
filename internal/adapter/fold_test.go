@@ -2,11 +2,14 @@ package adapter
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -370,5 +373,98 @@ func TestANonHeaderTokenIsRefusedWithoutEchoing(t *testing.T) {
 	})
 	if err == nil || strings.Contains(err.Error(), "SYNTH3TIC") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// ---- fold 3 (blind F1-F6, QA flake) ----
+
+func TestCheckDoesNotPrintTheTokenInItsConfigDetail(t *testing.T) {
+	f := newFake(t)
+	a := newAdapter(t, f, baseConfig())
+	a.ConfigError = "cannot read the config /home/" + token + "/c.json"
+	m := mustCall(t, a, "check", `{}`)
+	b, _ := json.Marshal(m)
+	if strings.Contains(string(b), token) {
+		t.Fatalf("check printed the token: %s", b)
+	}
+}
+
+func TestAWriteToAMovedRepositoryIsRefusedAndNothingIsWritten(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	f.Moved = map[string]string{"acme/app": "elsewhere/app"}
+	a := newAdapter(t, f, &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked"})
+	_ = a.Config.normalize()
+	if _, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil {
+		t.Fatal("a moved repository was written")
+	}
+	if len(f.Writes) != 0 {
+		t.Fatalf("writes: %v", f.Writes)
+	}
+}
+
+func TestAWriteIsNeverFollowedThroughARedirect(t *testing.T) {
+	via := []*http.Request{{Method: http.MethodPost, URL: &url.URL{Scheme: "https", Host: "h"}}}
+	req := &http.Request{Method: http.MethodGet, URL: &url.URL{Scheme: "https", Host: "h"}}
+	if err := sameOriginHTTPS(req, via); err == nil {
+		t.Fatal("a redirect on a POST must be refused")
+	}
+	via[0].Method = http.MethodGet
+	if err := sameOriginHTTPS(req, via); err != nil {
+		t.Fatalf("a same-origin read redirect is allowed: %v", err)
+	}
+}
+
+func TestATaskIDOutsideTheMarkerAlphabetIsRefusedBeforeAnyWrite(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	a := newAdapter(t, f, &Config{Repositories: []string{"acme/app"}, Comment: true})
+	_ = a.Config.normalize()
+	req := strings.Replace(markRequest(issueURL("acme/app", 1)), `"id":"t-1"`, `"id":"t 1/é"`, 1)
+	for i := 0; i < 2; i++ {
+		if _, r := call(t, a, "mark-tracked", req); r == nil || r.Code != ExitUsage {
+			t.Fatalf("want a usage refusal, got %v", r)
+		}
+	}
+	if len(f.Writes) != 0 {
+		t.Fatalf("writes: %v", f.Writes)
+	}
+}
+
+func TestDescribeRefusesAMalformedRequest(t *testing.T) {
+	a := &Adapter{Host: "github.com"}
+	for _, in := range []string{``, `not json`, `{"contractVersion":2}`, `{"contractVersion":1} {}`} {
+		if _, err := a.Handle(context.Background(), "describe", strings.NewReader(in)); err == nil {
+			t.Errorf("describe accepted %q", in)
+		}
+	}
+}
+
+func TestAConfigWithAStrayClosingDelimiterIsRefused(t *testing.T) {
+	for _, tail := range []string{"}", "]", " ]", "\n}"} {
+		p := filepath.Join(t.TempDir(), "c.json")
+		_ = os.WriteFile(p, []byte(`{"repositories":["a/b"]}`+tail), 0o600)
+		if _, err := LoadConfig(p); err == nil {
+			t.Errorf("accepted trailing %q", tail)
+		}
+	}
+}
+
+func TestTwoSimultaneousMarksLeaveOneCommentAndBothSucceed(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := &Config{Repositories: []string{"acme/app"}, Comment: true}
+	_ = cfg.normalize()
+	a := newAdapter(t, f, cfg)
+	// The extra comment a concurrent mark created: seed it, then mark.
+	for i := 0; i < 2; i++ {
+		c := Comment{ID: int64(500 + i), Body: trackedComment(taskIn{ID: "t-1"}, workerIn{Name: "Iris"})}
+		c.User.Login = f.Login
+		f.repos["acme/app"][0].Comments = append(f.repos["acme/app"][0].Comments, c)
+	}
+	mustCall(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	got := f.repos["acme/app"][0].Comments
+	if len(got) != 1 || got[0].ID != 500 {
+		t.Fatalf("want only the oldest comment (500) to survive, got %+v", got)
 	}
 }
