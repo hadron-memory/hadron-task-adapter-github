@@ -31,8 +31,11 @@ type Client struct {
 }
 
 // NewClient builds a client from the environment: GITHUB_TOKEN (the team's
-// credential), GITHUB_API_URL and GITHUB_GRAPHQL_URL (GitHub Enterprise).
-func NewClient(getenv func(string) string) *Client {
+// credential), GITHUB_API_URL and GITHUB_GRAPHQL_URL (GitHub Enterprise). The
+// credential travels only to an https endpoint with a host and no userinfo, and
+// a redirect that downgrades to http or leaves the endpoint's host is refused:
+// plain http is for test clients built directly, never for the executable.
+func NewClient(getenv func(string) string) (*Client, error) {
 	api := strings.TrimRight(getenv("GITHUB_API_URL"), "/")
 	if api == "" {
 		api = defaultAPI
@@ -45,7 +48,41 @@ func NewClient(getenv func(string) string) *Client {
 			gql = strings.TrimSuffix(api, "/v3") + "/graphql"
 		}
 	}
-	return &Client{API: api, GraphQL: gql, Token: getenv("GITHUB_TOKEN"), HTTP: &http.Client{Timeout: 30 * time.Second}}
+	for name, u := range map[string]string{"GITHUB_API_URL": api, "GITHUB_GRAPHQL_URL": gql} {
+		if err := checkEndpoint(u); err != nil {
+			return nil, &Refusal{Code: ExitRefused, Msg: name + " is not usable: " + err.Error()}
+		}
+	}
+	return &Client{API: api, GraphQL: gql, Token: getenv("GITHUB_TOKEN"), HTTP: &http.Client{Timeout: 30 * time.Second, CheckRedirect: sameOriginHTTPS}}, nil
+}
+
+// checkEndpoint requires an https URL with a host and no userinfo.
+func checkEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return errors.New("it is not a URL with a host")
+	}
+	if u.Scheme != "https" {
+		return errors.New("it must be https, so the credential is never sent in plain text")
+	}
+	if u.User != nil {
+		return errors.New("it must not carry userinfo")
+	}
+	return nil
+}
+
+// sameOriginHTTPS refuses a redirect that leaves https or the first request's host.
+func sameOriginHTTPS(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("too many redirects")
+	}
+	if req.URL.Scheme != "https" {
+		return errors.New("a redirect to a non-https URL is refused")
+	}
+	if !strings.EqualFold(req.URL.Host, via[0].URL.Host) {
+		return errors.New("a redirect to another host is refused")
+	}
+	return nil
 }
 
 // Issue is one tracker item as the adapter reads it.
@@ -186,7 +223,7 @@ func (c *Client) ReadIssues(ctx context.Context, repo string, states []string, s
 			return nil, err
 		}
 		if len(resp.Errors) > 0 {
-			return nil, &Refusal{Code: ExitRefused, Msg: "GitHub refused the issues read for " + repo + ": " + c.scrub(resp.Errors[0].Message)}
+			return nil, &Refusal{Code: ExitRefused, Msg: "GitHub refused the issues read for " + repo + ": " + cleanText(c.scrub(resp.Errors[0].Message), 300)}
 		}
 		if resp.Data.Repository == nil {
 			return nil, &Refusal{Code: ExitRefused, Msg: repo + " was not found or the credential cannot read it"}
@@ -268,9 +305,13 @@ func (c *Client) RemoveLabel(ctx context.Context, repo string, n int, label stri
 type Comment struct {
 	ID   int64  `json:"id"`
 	Body string `json:"body"`
+	User struct {
+		Login string `json:"login"`
+	} `json:"user"`
 }
 
-// ListComments reads at most pages pages of an issue's comments.
+// ListComments reads an issue's comments, at most pages pages of 100. When the
+// last page read was full it refuses: the scan cannot say a comment is absent.
 func (c *Client) ListComments(ctx context.Context, repo string, n, pages int) ([]Comment, error) {
 	var all []Comment
 	for p := 1; p <= pages; p++ {
@@ -280,10 +321,34 @@ func (c *Client) ListComments(ctx context.Context, repo string, n, pages int) ([
 		}
 		all = append(all, page...)
 		if len(page) < 100 {
-			break
+			return all, nil
 		}
 	}
-	return all, nil
+	return nil, &Refusal{Code: ExitRefused, Msg: fmt.Sprintf("%s#%d has more than %d comments, so the adapter cannot tell whether its own comment exists", repo, n, pages*100)}
+}
+
+// DeleteComment deletes a comment by id; one already gone is not an error.
+func (c *Client) DeleteComment(ctx context.Context, repo string, id int64) error {
+	code, err := c.do(ctx, http.MethodDelete, fmt.Sprintf("%s/repos/%s/issues/comments/%d", c.API, repo, id), nil, nil)
+	if code == http.StatusNotFound {
+		return nil
+	}
+	return err
+}
+
+// Login reads the authenticated account's login (a personal or fine-grained
+// token; an installation token has none, see Config.CommentAuthor).
+func (c *Client) Login(ctx context.Context) (string, error) {
+	var r struct {
+		Login string `json:"login"`
+	}
+	if _, err := c.do(ctx, http.MethodGet, c.API+"/user", nil, &r); err != nil {
+		return "", err
+	}
+	if r.Login == "" {
+		return "", errors.New("GitHub did not name the account")
+	}
+	return r.Login, nil
 }
 
 // CreateComment posts a comment.
@@ -298,10 +363,11 @@ func (c *Client) UpdateComment(ctx context.Context, repo string, id int64, body 
 	return err
 }
 
-// Ping asks GitHub for the rate limit, which needs no scope. It reports whether
-// GitHub answered at all and whether the credential (when there is one) was
-// accepted. It sends the token only when one is set.
-func (c *Client) Ping(ctx context.Context) (reachable, credentialAccepted bool, err error) {
+// Ping asks GitHub for the rate limit, which needs no scope. reachable means
+// GitHub answered; accepted is true only when a credential was sent and GitHub
+// answered 2xx. A 401 or 403 means the credential was refused; any other status
+// proves nothing about it, so accepted stays false and err says what came back.
+func (c *Client) Ping(ctx context.Context) (reachable, accepted bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.API+"/rate_limit", nil)
 	if err != nil {
 		return false, false, err
@@ -318,10 +384,10 @@ func (c *Client) Ping(ctx context.Context) (reachable, credentialAccepted bool, 
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized:
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		return true, false, nil
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return true, c.Token != "", nil
 	}
-	return true, c.Token != "", fmt.Errorf("GitHub answered HTTP %d", resp.StatusCode)
+	return true, false, fmt.Errorf("GitHub answered HTTP %d", resp.StatusCode)
 }

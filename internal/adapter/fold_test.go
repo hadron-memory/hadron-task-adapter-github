@@ -1,0 +1,334 @@
+package adapter
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// ---- the credential travels only to https, and only to the endpoint's own host ----
+
+func TestNewClientRefusesAnEndpointThatWouldSendTheTokenInPlainText(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	for name, m := range map[string]map[string]string{
+		"http api":          {"GITHUB_API_URL": "http://ghe.example.com/api/v3"},
+		"http graphql":      {"GITHUB_API_URL": "https://ghe.example.com/api/v3", "GITHUB_GRAPHQL_URL": "http://ghe.example.com/api/graphql"},
+		"userinfo":          {"GITHUB_API_URL": "https://u:p@ghe.example.com/api/v3"},
+		"no host":           {"GITHUB_API_URL": "https:///api"},
+		"not a url":         {"GITHUB_API_URL": "ghe"},
+		"ftp":               {"GITHUB_API_URL": "ftp://ghe.example.com"},
+		"graphql no scheme": {"GITHUB_API_URL": "https://ghe.example.com/api/v3", "GITHUB_GRAPHQL_URL": "ghe.example.com/graphql"},
+	} {
+		if _, err := NewClient(env(m)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	c, err := NewClient(env(map[string]string{"GITHUB_TOKEN": "t"}))
+	if err != nil || c.API != "https://api.github.com" || c.GraphQL != "https://api.github.com/graphql" {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	c, err = NewClient(env(map[string]string{"GITHUB_API_URL": "https://ghe.example.com/api/v3/"}))
+	if err != nil || c.GraphQL != "https://ghe.example.com/api/graphql" {
+		t.Fatalf("enterprise: %+v %v", c, err)
+	}
+}
+
+func TestRedirectsMustStayOnTheOriginOverHTTPS(t *testing.T) {
+	first, _ := http.NewRequest("GET", "https://api.example.com/x", nil)
+	for name, tc := range map[string]struct {
+		to string
+		ok bool
+	}{
+		"same host":           {"https://api.example.com/y", true},
+		"same host, any case": {"https://API.example.com/y", true},
+		"downgrade":           {"http://api.example.com/y", false},
+		"another host":        {"https://evil.example.net/y", false},
+	} {
+		next, _ := http.NewRequest("GET", tc.to, nil)
+		if err := sameOriginHTTPS(next, []*http.Request{first}); (err == nil) != tc.ok {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	via := make([]*http.Request, 5)
+	for i := range via {
+		via[i] = first
+	}
+	next, _ := http.NewRequest("GET", "https://api.example.com/y", nil)
+	if sameOriginHTTPS(next, via) == nil {
+		t.Error("an endless redirect chain must stop")
+	}
+}
+
+// The credential never reaches a plain-http host a redirect points at.
+func TestTokenIsNotSentWhereARedirectDowngrades(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("Authorization"))
+		mu.Unlock()
+	}))
+	defer plain.Close()
+	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/steal", http.StatusFound)
+	}))
+	defer tls.Close()
+	hc := tls.Client()
+	hc.CheckRedirect = sameOriginHTTPS
+	c := &Client{API: tls.URL, GraphQL: tls.URL + "/graphql", Token: token, HTTP: hc}
+	_, err := c.GetIssue(context.Background(), "acme/app", 1)
+	var r *Refusal
+	if !errors.As(err, &r) || strings.Contains(r.Msg, token) {
+		t.Fatalf("the redirect must be refused without the token in the message: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 0 {
+		t.Fatalf("the plain-http host was reached with %v", seen)
+	}
+}
+
+// ---- a comment is the adapter's own only if its author and its marker line say so ----
+
+func TestAnotherAuthorsMarkerCommentIsNeitherEditedNorBlocking(t *testing.T) {
+	f := newFake(t)
+	foreign := Comment{ID: 5, Body: commentMarker + "evil -->\nforeign text"}
+	foreign.User.Login = "someone-else"
+	malformed := Comment{ID: 6, Body: commentMarker + " not a marker line"}
+	malformed.User.Login = f.Login
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Comments: []Comment{foreign, malformed}})
+	cfg := baseConfig()
+	cfg.Comment = true
+	a := newAdapter(t, f, cfg)
+	mustCall(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if is.Comments[0].Body != foreign.Body || is.Comments[1].Body != malformed.Body {
+		t.Fatalf("a comment that is not the adapter's was edited: %+v", is.Comments)
+	}
+	if len(is.Comments) != 3 || !strings.HasPrefix(is.Comments[2].Body, commentMarker+"t-1 -->") {
+		t.Fatalf("the adapter must write its own comment: %+v", is.Comments)
+	}
+	// Releasing touches only its own comment.
+	mustCall(t, a, "untrack", fmt.Sprintf(`{"externalId":%q}`, issueURL("acme/app", 1)))
+	if is.Comments[0].Body != foreign.Body || is.Comments[1].Body != malformed.Body || !strings.Contains(is.Comments[2].Body, "No longer tracked") {
+		t.Fatalf("%+v", is.Comments)
+	}
+}
+
+func TestCommentModeNeedsAKnownAccount(t *testing.T) {
+	f := newFake(t)
+	f.Login = "-" // an installation token: GET /user answers 404
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := baseConfig()
+	cfg.Comment = true
+	if _, r := call(t, newAdapter(t, f, cfg), "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil || r.Code != ExitRefused || !strings.Contains(r.Msg, "commentAuthor") {
+		t.Fatalf("%+v", r)
+	}
+	// commentAuthor names the account, so no GET /user is needed.
+	f2 := newFake(t)
+	f2.Login = "-"
+	is := f2.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg.CommentAuthor = "my-app[bot]"
+	f2.Login = "my-app[bot]"
+	a := newAdapter(t, f2, cfg)
+	mustCall(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if len(is.Comments) != 1 {
+		t.Fatalf("%+v", is.Comments)
+	}
+}
+
+// ---- writes go only to issues that exist; a missing item is never an absent label ----
+
+func TestWritesRefusePullRequestsAndMissingItems(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 3, Title: "a pull request", PR: true, CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron:tracked"}})
+	cfg := baseConfig()
+	cfg.TrackedLabel, cfg.Comment = "hadron:tracked", true
+	cfg.Report = map[string]ReportAction{"FINISHED": {AddLabels: []string{"done"}}}
+	a := newAdapter(t, f, cfg)
+	pr := issueURL("acme/app", 3)
+	for name, tc := range map[string]struct{ call, req string }{
+		"mark-tracked": {"mark-tracked", markRequest(pr)},
+		"untrack":      {"untrack", fmt.Sprintf(`{"externalId":%q}`, pr)},
+		"report":       {"report", fmt.Sprintf(`{"externalId":%q,"task":{"id":"t"},"state":"FINISHED"}`, pr)},
+	} {
+		if _, r := call(t, a, tc.call, tc.req); r == nil || r.Code != ExitUsage {
+			t.Errorf("%s on a pull request: %+v", name, r)
+		}
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Fatalf("a pull request was written to: %v", w)
+	}
+	// A missing issue: a label-only untrack must not report success from a 404.
+	missing := issueURL("acme/app", 99)
+	cfg.Comment = false
+	if _, r := call(t, a, "untrack", fmt.Sprintf(`{"externalId":%q}`, missing)); r == nil || r.Code != ExitNotFound {
+		t.Fatalf("untrack of a missing issue: %+v", r)
+	}
+	if _, r := call(t, a, "mark-tracked", markRequest(missing)); r == nil || r.Code != ExitNotFound {
+		t.Fatalf("mark of a missing issue: %+v", r)
+	}
+}
+
+// ---- the comment scan is complete or it refuses ----
+
+func TestACommentScanThatCannotBeCompleteRefuses(t *testing.T) {
+	f := newFake(t)
+	var cs []Comment
+	for i := 1; i <= 1000; i++ { // exactly the ten pages the scan reads: the last page is full
+		c := Comment{ID: int64(i), Body: "human"}
+		c.User.Login = "someone"
+		cs = append(cs, c)
+	}
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Comments: cs})
+	cfg := baseConfig()
+	cfg.Comment = true
+	_, r := call(t, newAdapter(t, f, cfg), "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if r == nil || r.Code != ExitRefused || !strings.Contains(r.Msg, "comments") {
+		t.Fatalf("%+v", r)
+	}
+	for _, w := range f.writes() {
+		if strings.Contains(w, "POST") && strings.HasSuffix(w, "/comments") {
+			t.Fatalf("a comment was created without proving the adapter had none: %v", f.writes())
+		}
+	}
+}
+
+// ---- partial writes repair on retry; simultaneous marks end with one comment ----
+
+func TestAFailureBetweenTheLabelAndTheCommentIsRepairedByARetry(t *testing.T) {
+	f := newFake(t)
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := baseConfig()
+	cfg.TrackedLabel, cfg.Comment = "hadron:tracked", true
+	a := newAdapter(t, f, cfg)
+	f.FailNext["POST /comments"] = true
+	if _, r := call(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1))); r == nil || r.Code != ExitRefused {
+		t.Fatalf("the comment failure must be reported: %+v", r)
+	}
+	if fmt.Sprint(is.Labels) != "[hadron:tracked]" || len(is.Comments) != 0 {
+		t.Fatalf("labels %v comments %+v: the partial state is what a retry must repair", is.Labels, is.Comments)
+	}
+	mustCall(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if len(is.Labels) != 1 || len(is.Comments) != 1 {
+		t.Fatalf("after the retry: labels %v comments %+v", is.Labels, is.Comments)
+	}
+}
+
+func TestSimultaneousMarksEndWithOneComment(t *testing.T) {
+	f := newFake(t)
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := baseConfig()
+	cfg.Comment = true
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a := newAdapter(t, f, cfg)
+			if _, err := a.Handle(context.Background(), "mark-tracked", strings.NewReader(withVersion(markRequest(issueURL("acme/app", 1))))); err != nil {
+				t.Errorf("%v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	own := 0
+	for _, c := range is.Comments {
+		if strings.HasPrefix(c.Body, commentMarker) {
+			own++
+		}
+	}
+	if own != 1 {
+		t.Fatalf("%d adapter comments after simultaneous marks: %+v", own, is.Comments)
+	}
+}
+
+// ---- a request is one JSON object of this contract version, within bounds ----
+
+func TestMalformedRequestsAreRefusedBeforeAnyAction(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := baseConfig()
+	cfg.TrackedLabel = "hadron:tracked"
+	a := newAdapter(t, f, cfg)
+	good := markRequest(issueURL("acme/app", 1))
+	for name, req := range map[string]string{
+		"null":                  `null`,
+		"a number":              `1`,
+		"a string":              `"x"`,
+		"two objects":           good + " " + good,
+		"trailing text":         good + "x",
+		"trailing past the cap": good + strings.Repeat(" ", maxRequest),
+		"no contractVersion":    `{"externalId":"` + issueURL("acme/app", 1) + `"}`,
+		"a worker that is 5":    strings.Replace(good, `"worker":{`, `"worker":5,"x":{`, 1),
+		"a worker as a list":    strings.Replace(good, `"worker":{`, `"worker":[],"x":{`, 1),
+		"over the size cap":     strings.Replace(good, `{`, `{"pad":"`+strings.Repeat("a", maxRequest)+`",`, 1),
+	} {
+		out, err := a.Handle(context.Background(), "mark-tracked", strings.NewReader(req))
+		var r *Refusal
+		if err == nil || !errors.As(err, &r) || r.Code != ExitUsage {
+			t.Errorf("%s: %v %v", name, out, err)
+		}
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Fatalf("a malformed request wrote: %v", w)
+	}
+}
+
+// ---- check says only what it knows ----
+
+func TestCheckNeedsAffirmativeEvidenceOfAnAcceptedCredential(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status       int
+		valid, reach bool
+	}{
+		"ok":  {0, true, true},
+		"404": {404, false, true},
+		"500": {500, false, true},
+		"401": {401, false, true},
+		"403": {403, false, true},
+	} {
+		f := newFake(t)
+		f.RateLimitStatus = tc.status
+		a := &Adapter{Config: baseConfig(), Client: f.client(token)}
+		m := mustCall(t, a, "check", `{}`)
+		if m["credentialValid"] != tc.valid || m["reachable"] != tc.reach || m["credentialPresent"] != true {
+			t.Errorf("%s: %v", name, m)
+		}
+	}
+}
+
+func TestCheckRunsWithoutAConfigAndSaysWhy(t *testing.T) {
+	f := newFake(t)
+	a := &Adapter{Client: f.client(token), ConfigError: "the config /x/c.json is not valid: repositories is empty"}
+	m := mustCall(t, a, "check", `{}`)
+	if m["configValid"] != false || !strings.Contains(fmt.Sprint(m["configDetail"]), "repositories is empty") || m["reachable"] != true {
+		t.Fatalf("%v", m)
+	}
+}
+
+// ---- report states are compared without regard to case, on both sides ----
+
+func TestReportStatesAreCaseInsensitiveAndCollisionsRefused(t *testing.T) {
+	f := newFake(t)
+	is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	c := &Config{Repositories: []string{"acme/app"}, Report: map[string]ReportAction{"finished": {AddLabels: []string{"done"}}}}
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	a := newAdapter(t, f, c)
+	mustCall(t, a, "report", fmt.Sprintf(`{"externalId":%q,"task":{"id":"t"},"state":"FINISHED"}`, issueURL("acme/app", 1)))
+	if fmt.Sprint(is.Labels) != "[done]" {
+		t.Fatalf("a config key in lower case must match an upper-case state: %v", is.Labels)
+	}
+	dup := &Config{Repositories: []string{"acme/app"}, Report: map[string]ReportAction{"FINISHED": {}, "finished": {}}}
+	if err := dup.normalize(); err == nil {
+		t.Fatal("two report keys that differ only in case must be refused")
+	}
+}

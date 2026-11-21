@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,7 +27,12 @@ const (
 	maxExternalID   = 512 // code points, the server's cap
 	maxBodyRunes    = 64 << 10
 	commentMarker   = "<!-- hadron-task:"
+	maxRequest      = 1 << 20
 )
+
+// markerLine is the first line of a comment the adapter owns: the marker, a
+// task id (or "released") and the closing. Anything else is someone's text.
+var markerLine = regexp.MustCompile(`^<!-- hadron-task:([A-Za-z0-9._:-]{1,128}|released) -->(\n|$)`)
 
 // Exit codes. The CLI treats every non-zero exit as the adapter's refusal and
 // shows the first 4 KiB of stderr, so each carries a one-line message.
@@ -51,7 +58,9 @@ type Adapter struct {
 	Config *Config
 	Client *Client
 	Host   string // the tracker's web host, e.g. github.com
-	Now    func() time.Time
+	// ConfigError is why the config could not be loaded; only `check` runs
+	// without one, and reports it.
+	ConfigError string
 }
 
 // Handle runs one call: stdin is the request object, the returned value is the
@@ -63,6 +72,9 @@ func (a *Adapter) Handle(ctx context.Context, call string, stdin io.Reader) (any
 	req, err := decodeRequest(stdin)
 	if err != nil {
 		return nil, err
+	}
+	if call == "check" && a.Client != nil {
+		return a.check(ctx) // runs without a (valid) config: it is how a bad setup is diagnosed
 	}
 	if a.Config == nil || a.Client == nil {
 		return nil, &Refusal{Code: ExitRefused, Msg: "the adapter is not configured"}
@@ -82,8 +94,6 @@ func (a *Adapter) Handle(ctx context.Context, call string, stdin io.Reader) (any
 		return a.changedSince(ctx, req)
 	case "normalize":
 		return a.normalize(ctx, req)
-	case "check":
-		return a.check(ctx)
 	}
 	return nil, &Refusal{Code: ExitUsage, Msg: "unknown call " + strconv.Quote(call) + "; the calls are " + strings.Join(Calls, ", ")}
 }
@@ -113,15 +123,31 @@ type request struct {
 }
 
 func decodeRequest(r io.Reader) (*request, error) {
-	raw, err := io.ReadAll(io.LimitReader(r, 1<<20))
+	// One byte past the cap is read, so an oversized request is refused rather
+	// than silently cut (trailing data beyond the cap would otherwise be hidden).
+	raw, err := io.ReadAll(io.LimitReader(r, maxRequest+1))
 	if err != nil || len(strings.TrimSpace(string(raw))) == 0 {
 		return nil, &Refusal{Code: ExitUsage, Msg: "the request is empty: one JSON object is expected on stdin"}
 	}
-	var q request
-	if err := json.Unmarshal(raw, &q); err != nil {
+	if len(raw) > maxRequest {
+		return nil, &Refusal{Code: ExitUsage, Msg: fmt.Sprintf("the request is larger than %d bytes", maxRequest)}
+	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, &Refusal{Code: ExitUsage, Msg: "the request is not one JSON object"}
 	}
-	if q.ContractVersion != nil && *q.ContractVersion != ContractVersion {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var q request
+	if err := dec.Decode(&q); err != nil {
+		return nil, &Refusal{Code: ExitUsage, Msg: "the request is not one JSON object"}
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, &Refusal{Code: ExitUsage, Msg: "the request has text after its JSON object"}
+	}
+	// The CLI puts contractVersion in every request (describe included).
+	if q.ContractVersion == nil {
+		return nil, &Refusal{Code: ExitUsage, Msg: "the request has no contractVersion"}
+	}
+	if *q.ContractVersion != ContractVersion {
 		return nil, &Refusal{Code: ExitUsage, Msg: fmt.Sprintf("this adapter speaks contract version %d, the request says %d", ContractVersion, *q.ContractVersion)}
 	}
 	return &q, nil
@@ -195,7 +221,7 @@ func (a *Adapter) listUntracked(ctx context.Context, q *request) (any, error) {
 		out.Items = append(out.Items, itemOut{ExternalID: is.URL, Title: cleanText(is.Title, 1024)})
 	}
 	if more {
-		c := encodeCursor(cursorKey{T: rest[len(rest)-1].CreatedAt, R: rest[len(rest)-1].Repo, N: rest[len(rest)-1].Number})
+		c := encodeCursor(cursorKey{Time: rest[len(rest)-1].CreatedAt, Repo: rest[len(rest)-1].Repo, Number: rest[len(rest)-1].Number})
 		out.NextCursor = &c
 	}
 	return out, nil
@@ -252,9 +278,9 @@ func parseTime(s string) time.Time {
 // ---- cursor: an opaque keyset position, never an offset ----
 
 type cursorKey struct {
-	T string `json:"t"` // the last item's timestamp
-	R string `json:"r"` // its repository
-	N int    `json:"n"` // its number
+	Time   string `json:"t"` // the last item's timestamp (created, or updated for changed-since)
+	Repo   string `json:"r"` // its repository
+	Number int    `json:"n"` // its number
 }
 
 func encodeCursor(k cursorKey) string {
@@ -269,7 +295,7 @@ func decodeCursor(s string) (cursorKey, error) {
 		return k, &Refusal{Code: ExitUsage, Msg: "the cursor is not one this adapter issued"}
 	}
 	b, err := base64.RawURLEncoding.DecodeString(rest)
-	if err != nil || json.Unmarshal(b, &k) != nil || k.T == "" || k.R == "" || k.N < 1 {
+	if err != nil || json.Unmarshal(b, &k) != nil || k.Time == "" || k.Repo == "" || k.Number < 1 {
 		return k, &Refusal{Code: ExitUsage, Msg: "the cursor is not one this adapter issued"}
 	}
 	return k, nil
@@ -278,7 +304,7 @@ func decodeCursor(s string) (cursorKey, error) {
 // before reports whether the cursor position is strictly before is, in the
 // created order (the next page starts at the first item it is before).
 func (k cursorKey) before(is Issue) bool {
-	return lessCreated(Issue{CreatedAt: k.T, Repo: k.R, Number: k.N}, is)
+	return lessCreated(Issue{CreatedAt: k.Time, Repo: k.Repo, Number: k.Number}, is)
 }
 
 // ---- mark-tracked, untrack, report ----
@@ -296,17 +322,45 @@ type workerIn struct {
 	Model string `json:"model"`
 }
 
-func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
-	repo, n, err := a.parseExternalID(q.ExternalID)
+// writeTarget resolves the item a write would touch and refuses unless it is an
+// issue (never a pull request: GitHub's label and comment endpoints take both)
+// in a configured repository that exists. Every write call goes through it
+// first, so a missing item can never be mistaken for an absent label.
+func (a *Adapter) writeTarget(ctx context.Context, externalID string) (string, int, error) {
+	repo, n, err := a.parseExternalID(externalID)
 	if err != nil {
-		return nil, err
+		return "", 0, err
 	}
+	if _, err := a.Client.GetIssue(ctx, repo, n); err != nil {
+		return "", 0, err
+	}
+	return repo, n, nil
+}
+
+func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 	var task taskIn
-	var worker workerIn
 	if len(q.Task) == 0 || json.Unmarshal(q.Task, &task) != nil || task.ID == "" {
 		return nil, &Refusal{Code: ExitUsage, Msg: "mark-tracked needs the task (its id)"}
 	}
-	_ = json.Unmarshal(q.Worker, &worker)
+	var worker workerIn
+	if len(q.Worker) != 0 && string(q.Worker) != "null" {
+		if err := json.Unmarshal(q.Worker, &worker); err != nil {
+			return nil, &Refusal{Code: ExitUsage, Msg: "the worker is not an object of id, name, role and model"}
+		}
+	}
+	if a.Config.TrackedLabel == "" && !a.Config.Comment {
+		if _, _, err := a.parseExternalID(q.ExternalID); err != nil { // judged, but nothing to write
+			return nil, err
+		}
+		return map[string]any{}, nil
+	}
+	repo, n, err := a.writeTarget(ctx, q.ExternalID)
+	if err != nil {
+		return nil, err
+	}
+	// Every write is idempotent, so a retry after a failure between them (the
+	// label set, the comment not) repairs it: the CLI leaves the claim standing
+	// and reports the failed mark, and running mark-tracked again completes it.
 	if a.Config.TrackedLabel != "" {
 		if err := a.Client.AddLabels(ctx, repo, n, a.Config.TrackedLabel); err != nil {
 			return nil, err
@@ -321,22 +375,28 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 }
 
 func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
-	repo, n, err := a.parseExternalID(q.ExternalID)
+	if a.Config.TrackedLabel == "" && !a.Config.Comment {
+		if _, _, err := a.parseExternalID(q.ExternalID); err != nil {
+			return nil, err
+		}
+		return map[string]any{}, nil
+	}
+	repo, n, err := a.writeTarget(ctx, q.ExternalID)
 	if err != nil {
 		return nil, err
 	}
 	if a.Config.TrackedLabel != "" {
-		if err := a.Client.RemoveLabel(ctx, repo, n, a.Config.TrackedLabel); err != nil {
+		if err := a.Client.RemoveLabel(ctx, repo, n, a.Config.TrackedLabel); err != nil { // the issue exists: a 404 is the absent label
 			return nil, err
 		}
 	}
 	if a.Config.Comment {
-		id, err := a.findComment(ctx, repo, n)
+		own, err := a.ownComments(ctx, repo, n)
 		if err != nil {
 			return nil, err
 		}
-		if id != 0 {
-			if err := a.Client.UpdateComment(ctx, repo, id, commentMarker+"released -->\nNo longer tracked in Hadron: the task was released."); err != nil {
+		for _, c := range own {
+			if err := a.Client.UpdateComment(ctx, repo, c.ID, commentMarker+"released -->\nNo longer tracked in Hadron: the task was released."); err != nil {
 				return nil, err
 			}
 		}
@@ -345,16 +405,16 @@ func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
 }
 
 func (a *Adapter) report(ctx context.Context, q *request) (any, error) {
-	repo, n, err := a.parseExternalID(q.ExternalID)
+	act, ok := a.Config.Report[strings.ToUpper(strings.TrimSpace(q.State))] // keys are normalized at load
+	if !ok {
+		if _, _, err := a.parseExternalID(q.ExternalID); err != nil {
+			return nil, err
+		}
+		return map[string]any{}, nil // no action configured for this state
+	}
+	repo, n, err := a.writeTarget(ctx, q.ExternalID)
 	if err != nil {
 		return nil, err
-	}
-	act, ok := a.Config.Report[strings.ToUpper(strings.TrimSpace(q.State))]
-	if !ok {
-		act, ok = a.Config.Report[q.State]
-	}
-	if !ok {
-		return map[string]any{}, nil // no action configured for this state
 	}
 	if err := a.Client.AddLabels(ctx, repo, n, act.AddLabels...); err != nil {
 		return nil, err
@@ -401,28 +461,70 @@ func safeHTTPS(u string) string {
 	return u
 }
 
-func (a *Adapter) findComment(ctx context.Context, repo string, n int) (int64, error) {
-	cs, err := a.Client.ListComments(ctx, repo, n, 10)
+// ownLogin is the account whose comments the adapter may edit: the config's
+// commentAuthor, else the token's own login.
+func (a *Adapter) ownLogin(ctx context.Context) (string, error) {
+	if a.Config.CommentAuthor != "" {
+		return a.Config.CommentAuthor, nil
+	}
+	login, err := a.Client.Login(ctx)
 	if err != nil {
-		return 0, err
+		return "", &Refusal{Code: ExitRefused, Msg: "comment needs to know which comments are the adapter's own, and GET /user did not name the token's account; set commentAuthor in the config (for a GitHub App installation token, its bot login)"}
 	}
-	for _, c := range cs {
-		if strings.HasPrefix(c.Body, commentMarker) {
-			return c.ID, nil
-		}
-	}
-	return 0, nil
+	return login, nil
 }
 
+// ownComments are the comments that start with a valid marker line AND were
+// written by the adapter's own account, oldest first. A marker in someone
+// else's comment is only text.
+func (a *Adapter) ownComments(ctx context.Context, repo string, n int) ([]Comment, error) {
+	login, err := a.ownLogin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	all, err := a.Client.ListComments(ctx, repo, n, 10)
+	if err != nil {
+		return nil, err
+	}
+	var own []Comment
+	for _, c := range all {
+		if strings.EqualFold(c.User.Login, login) && markerLine.MatchString(c.Body) {
+			own = append(own, c)
+		}
+	}
+	sort.Slice(own, func(i, j int) bool { return own[i].ID < own[j].ID })
+	return own, nil
+}
+
+// upsertComment keeps exactly one adapter comment on the issue: it edits the
+// oldest own comment, or creates one. After a create it re-reads and, if a
+// concurrent mark created another, keeps the oldest and deletes the extras
+// (its own comments only), so two simultaneous marks end with one comment.
 func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body string) error {
-	id, err := a.findComment(ctx, repo, n)
+	own, err := a.ownComments(ctx, repo, n)
 	if err != nil {
 		return err
 	}
-	if id != 0 {
-		return a.Client.UpdateComment(ctx, repo, id, body)
+	if len(own) == 0 {
+		if err := a.Client.CreateComment(ctx, repo, n, body); err != nil {
+			return err
+		}
+		if own, err = a.ownComments(ctx, repo, n); err != nil {
+			return err
+		}
 	}
-	return a.Client.CreateComment(ctx, repo, n, body)
+	if len(own) == 0 {
+		return &Refusal{Code: ExitRefused, Msg: "the comment was written but could not be read back"}
+	}
+	if err := a.Client.UpdateComment(ctx, repo, own[0].ID, body); err != nil {
+		return err
+	}
+	for _, extra := range own[1:] {
+		if err := a.Client.DeleteComment(ctx, repo, extra.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- get, normalize, check ----
@@ -459,9 +561,12 @@ func (a *Adapter) normalize(ctx context.Context, q *request) (any, error) {
 
 func (a *Adapter) check(ctx context.Context) (any, error) {
 	reachable, accepted, err := a.Client.Ping(ctx)
-	out := map[string]any{"credentialPresent": a.Client.Token != "", "credentialValid": accepted, "reachable": reachable}
+	out := map[string]any{"credentialPresent": a.Client.Token != "", "credentialValid": accepted, "reachable": reachable, "configValid": a.Config != nil}
 	if err != nil {
-		out["detail"] = a.Client.scrub(err.Error())
+		out["detail"] = cleanText(a.Client.scrub(err.Error()), 512)
+	}
+	if a.ConfigError != "" {
+		out["configDetail"] = cleanText(a.ConfigError, 512)
 	}
 	return out, nil
 }
@@ -532,24 +637,24 @@ func (a *Adapter) changedSince(ctx context.Context, q *request) (any, error) {
 		out.Items = append(out.Items, changed{ExternalID: is.URL, Title: cleanText(is.Title, 1024), State: is.State, UpdatedAt: is.UpdatedAt})
 	}
 	if more {
-		c := encodeCursor(cursorKey{T: rest[len(rest)-1].UpdatedAt, R: rest[len(rest)-1].Repo, N: rest[len(rest)-1].Number})
+		c := encodeCursor(cursorKey{Time: rest[len(rest)-1].UpdatedAt, Repo: rest[len(rest)-1].Repo, Number: rest[len(rest)-1].Number})
 		out.NextCursor = &c
 	}
 	return out, nil
 }
 
 func updatedAfter(k cursorKey, is Issue) bool {
-	if k.T != is.UpdatedAt {
-		tk, ti := parseTime(k.T), parseTime(is.UpdatedAt)
+	if k.Time != is.UpdatedAt {
+		tk, ti := parseTime(k.Time), parseTime(is.UpdatedAt)
 		if !tk.Equal(ti) {
 			return tk.Before(ti)
 		}
-		return k.T < is.UpdatedAt
+		return k.Time < is.UpdatedAt
 	}
-	if k.R != is.Repo {
-		return k.R < is.Repo
+	if k.Repo != is.Repo {
+		return k.Repo < is.Repo
 	}
-	return k.N < is.Number
+	return k.Number < is.Number
 }
 
 // ---- external ids and references ----

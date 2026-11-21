@@ -11,50 +11,76 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/hadron-memory/hadron-task-adapter-github/internal/adapter"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, os.Getenv)) }
 
-func run(args []string, stdin *os.File, stdout, stderr *os.File, getenv func(string) string) int {
+func run(args []string, stdin, stdout, stderr *os.File, getenv func(string) string) int {
 	if len(args) != 1 {
 		fmt.Fprintln(stderr, "usage: hadron-task-adapter-github <call>   call is one of: "+strings.Join(adapter.Calls, ", ")+" (request JSON on stdin)")
 		return adapter.ExitUsage
 	}
+	call := args[0]
 	a := &adapter.Adapter{Host: hostOf(getenv("GITHUB_SERVER_URL"))}
-	if args[0] != "describe" {
+	if call != "describe" {
+		client, err := adapter.NewClient(getenv)
+		if err != nil {
+			return refuse(stderr, err)
+		}
+		a.Client = client
 		path, err := adapter.ConfigPath(getenv, os.UserHomeDir)
 		if err == nil {
-			var cfg *adapter.Config
-			cfg, err = adapter.LoadConfig(path)
-			a.Config = cfg
+			a.Config, err = adapter.LoadConfig(path)
 		}
 		if err != nil {
-			fmt.Fprintln(stderr, err)
-			return adapter.ExitRefused
+			a.Config = nil
+			if call != "check" { // check runs without a config, and says why it has none
+				return refuse(stderr, err)
+			}
+			a.ConfigError = err.Error()
 		}
-		a.Client = adapter.NewClient(getenv)
 	}
-	out, err := a.Handle(context.Background(), args[0], stdin)
+	out, err := a.Handle(context.Background(), call, stdin)
 	if err != nil {
-		var r *adapter.Refusal
-		if errors.As(err, &r) {
-			fmt.Fprintln(stderr, r.Msg)
-			return r.Code
-		}
-		fmt.Fprintln(stderr, err)
-		return adapter.ExitRefused
+		return refuse(stderr, err)
 	}
 	if err := json.NewEncoder(stdout).Encode(out); err != nil {
-		fmt.Fprintln(stderr, err)
-		return adapter.ExitRefused
+		return refuse(stderr, err)
 	}
 	return 0
 }
 
+// refuse prints err as ONE line (the CLI shows the first 4 KiB of stderr, and an
+// upstream message must not smuggle in line breaks or terminal controls) and
+// returns its exit code.
+func refuse(stderr *os.File, err error) int {
+	code := adapter.ExitRefused
+	var r *adapter.Refusal
+	if errors.As(err, &r) {
+		code = r.Code
+	}
+	fmt.Fprintln(stderr, oneLine(err.Error(), 1000))
+	return code
+}
+
+func oneLine(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			r = ' '
+		}
+		if b.Len()+len(string(r)) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // hostOf reads the host of GITHUB_SERVER_URL (GitHub Enterprise); empty means github.com.
 func hostOf(serverURL string) string {
-	s := strings.TrimPrefix(strings.TrimPrefix(strings.TrimRight(serverURL, "/"), "https://"), "http://")
-	return s
+	return strings.TrimPrefix(strings.TrimPrefix(strings.TrimRight(serverURL, "/"), "https://"), "http://")
 }

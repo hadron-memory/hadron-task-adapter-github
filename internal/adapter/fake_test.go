@@ -41,10 +41,18 @@ type fakeGitHub struct {
 	nextCID  int64
 	// RateLimited answers 403 with the exhausted-limit header.
 	RateLimited bool
+	// Login is the account the token acts as (GET /user, and the author of the
+	// comments the adapter writes); "-" makes GET /user answer 404 (an
+	// installation token).
+	Login string
+	// FailNext makes the next request whose "METHOD path-suffix" matches answer 500, once.
+	FailNext map[string]bool
+	// RateLimitStatus overrides /rate_limit's status when non-zero.
+	RateLimitStatus int
 }
 
 func newFake(t *testing.T) *fakeGitHub {
-	f := &fakeGitHub{t: t, repos: map[string][]*fakeIssue{"acme/app": nil, "acme/lib": nil}, nextCID: 1000}
+	f := &fakeGitHub{t: t, repos: map[string][]*fakeIssue{"acme/app": nil, "acme/lib": nil}, nextCID: 1000, Login: "adapter-bot", FailNext: map[string]bool{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -89,6 +97,21 @@ func (f *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"message":"boom `+f.Token+`"}`)
 		return
 	}
+	for k := range f.FailNext {
+		if m, suffix, _ := strings.Cut(k, " "); m == r.Method && strings.HasSuffix(r.URL.Path, suffix) {
+			delete(f.FailNext, k)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+	if r.URL.Path == "/user" {
+		if f.Login == "-" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, `{"login":"`+f.Login+`"}`)
+		return
+	}
 	if f.RateLimited {
 		w.Header().Set("X-RateLimit-Remaining", "0")
 		w.WriteHeader(http.StatusForbidden)
@@ -99,6 +122,10 @@ func (f *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/rate_limit" {
+		if f.RateLimitStatus != 0 {
+			w.WriteHeader(f.RateLimitStatus)
+			return
+		}
 		if f.Token != "" && r.Header.Get("Authorization") != "" && r.Header.Get("Authorization") != "Bearer "+f.Token {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
@@ -234,7 +261,15 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 		f.Writes = append(f.Writes, r.Method+" "+r.URL.Path)
 		var b struct{ Labels []string }
 		_ = json.NewDecoder(r.Body).Decode(&b)
-		is.Labels = append(is.Labels, b.Labels...)
+		for _, l := range b.Labels { // GitHub adds a label idempotently
+			has := false
+			for _, e := range is.Labels {
+				has = has || e == l
+			}
+			if !has {
+				is.Labels = append(is.Labels, l)
+			}
+		}
 		_, _ = io.WriteString(w, `[]`)
 	case len(rest) == 2 && rest[0] == "labels" && r.Method == http.MethodDelete:
 		f.Writes = append(f.Writes, r.Method+" "+r.URL.Path)
@@ -265,7 +300,9 @@ func (f *fakeGitHub) rest(w http.ResponseWriter, r *http.Request) {
 		var b struct{ Body string }
 		_ = json.NewDecoder(r.Body).Decode(&b)
 		f.nextCID++
-		is.Comments = append(is.Comments, Comment{ID: f.nextCID, Body: b.Body})
+		c := Comment{ID: f.nextCID, Body: b.Body}
+		c.User.Login = f.Login
+		is.Comments = append(is.Comments, c)
 		_, _ = io.WriteString(w, `{}`)
 	default:
 		w.WriteHeader(http.StatusNotFound)

@@ -27,6 +27,7 @@ func newAdapter(t *testing.T, f *fakeGitHub, c *Config) *Adapter {
 // call runs one call and returns the answer as a map, or the *Refusal.
 func call(t *testing.T, a *Adapter, name, req string) (map[string]any, *Refusal) {
 	t.Helper()
+	req = withVersion(req)
 	out, err := a.Handle(context.Background(), name, strings.NewReader(req))
 	if err != nil {
 		var r *Refusal
@@ -44,6 +45,20 @@ func call(t *testing.T, a *Adapter, name, req string) (map[string]any, *Refusal)
 		t.Fatal(err)
 	}
 	return m, nil
+}
+
+// withVersion adds "contractVersion":1 to a JSON object request that lacks it
+// (the CLI puts it in every request); anything else is passed through untouched.
+func withVersion(req string) string {
+	var m map[string]json.RawMessage
+	if json.Unmarshal([]byte(req), &m) != nil || m == nil {
+		return req
+	}
+	if _, ok := m["contractVersion"]; !ok {
+		m["contractVersion"] = json.RawMessage("1")
+	}
+	b, _ := json.Marshal(m)
+	return string(b)
 }
 
 func mustCall(t *testing.T, a *Adapter, name, req string) map[string]any {
@@ -501,7 +516,7 @@ func TestTransportErrorTextNeverCarriesTheCredential(t *testing.T) {
 // so the test can show the refusal text itself.
 func callWithoutTokenCheck(t *testing.T, a *Adapter, name, req string) (any, *Refusal) {
 	t.Helper()
-	out, err := a.Handle(context.Background(), name, strings.NewReader(req))
+	out, err := a.Handle(context.Background(), name, strings.NewReader(withVersion(req)))
 	var r *Refusal
 	if err != nil && !errors.As(err, &r) {
 		t.Fatal(err)

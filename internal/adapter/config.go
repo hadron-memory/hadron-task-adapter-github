@@ -51,9 +51,16 @@ type Config struct {
 	// Comment, when true, makes mark-tracked leave one comment naming the task
 	// and worker (updated, not repeated, on a re-mark).
 	Comment bool `json:"comment"`
+	// CommentAuthor is the GitHub login of the account the token acts as. With
+	// comment on, the adapter edits only comments carrying its marker AND written
+	// by this login, so it never overwrites someone else's text. Unset, the
+	// login is read from GET /user, which a personal or fine-grained token
+	// answers; an installation token (a GitHub App) cannot, so name the app's
+	// bot login here (for example "my-app[bot]").
+	CommentAuthor string `json:"commentAuthor"`
 	// DefaultRepository lets `normalize` accept "#123".
 	DefaultRepository string `json:"defaultRepository"`
-	// Report maps a Hadron task state (e.g. "FINISHED") to label changes.
+	// Report maps a Hadron task state (e.g. "FINISHED", any case) to label changes.
 	Report map[string]ReportAction `json:"report"`
 	// MaxPagesPerRepository bounds the tracker read (100 issues a page); 0 is
 	// the default of 20. A repository past it is refused, never listed in part.
@@ -148,15 +155,24 @@ func (c *Config) normalize() error {
 	if c.MaxPagesPerRepository < 0 {
 		return errors.New("maxPagesPerRepository cannot be negative")
 	}
+	normalized := map[string]ReportAction{}
 	for state, a := range c.Report {
-		if strings.TrimSpace(state) == "" {
+		key := strings.ToUpper(strings.TrimSpace(state))
+		if key == "" {
 			return errors.New("report has a blank state")
+		}
+		if _, dup := normalized[key]; dup {
+			return fmt.Errorf("report names the state %q twice (states are compared without regard to case)", key)
 		}
 		for _, l := range append(append([]string{}, a.AddLabels...), a.RemoveLabels...) {
 			if strings.TrimSpace(l) == "" {
 				return fmt.Errorf("report[%s] has a blank label", state)
 			}
 		}
+		normalized[key] = a
+	}
+	if c.Report != nil {
+		c.Report = normalized
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ package conformance
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/hadron-memory/hadron-cli/pkg/intakecontract"
@@ -22,7 +24,7 @@ import (
 // A fake tracker: 230 open issues in one repository, 100 per GraphQL page.
 func fakeGitHub(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" {
 			http.NotFound(w, r)
 			return
@@ -31,6 +33,10 @@ func fakeGitHub(t *testing.T) *httptest.Server {
 			Variables map[string]any `json:"variables"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.Variables["owner"] == "broken" { // a GraphQL error whose text has line breaks
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []map[string]string{{"message": "first line\nsecond line\x1b[31m"}}})
+			return
+		}
 		start := 0
 		if a, ok := req.Variables["after"].(string); ok {
 			start, _ = strconv.Atoi(a)
@@ -70,20 +76,35 @@ type harness struct {
 	env []string
 }
 
-func newHarness(t *testing.T) *harness {
+func newHarness(t *testing.T) *harness { return newHarnessFor(t, `{"repositories":["acme/app"]}`) }
+
+func newHarnessFor(t *testing.T, config string) *harness {
 	srv := fakeGitHub(t)
 	cfg := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(cfg, []byte(`{"repositories":["acme/app"]}`), 0o600); err != nil {
+	if err := os.WriteFile(cfg, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The adapter refuses a plain-http endpoint, so the fake is TLS and the
+	// adapter is told to trust its certificate (Go reads SSL_CERT_FILE).
+	certFile := filepath.Join(t.TempDir(), "fake-github.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(certFile, pemBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return &harness{bin: buildAdapter(t), env: []string{
-		"GITHUB_ADAPTER_CONFIG=" + cfg, "GITHUB_TOKEN=ghp_conformance", "GITHUB_API_URL=" + srv.URL, "GITHUB_GRAPHQL_URL=" + srv.URL + "/graphql",
+		"SSL_CERT_FILE=" + certFile, "GITHUB_ADAPTER_CONFIG=" + cfg, "GITHUB_TOKEN=ghp_conformance", "GITHUB_API_URL=" + srv.URL, "GITHUB_GRAPHQL_URL=" + srv.URL + "/graphql",
 		"PATH=" + os.Getenv("PATH"), // the CLI removes every HADRON_* variable: none is given
 	}}
 }
 
 // run calls the adapter as `<exe> <call>` with one JSON request on stdin.
 func (h *harness) run(t *testing.T, call string, req map[string]any) ([]byte, int) {
+	out, _, code := h.runErr(t, call, req)
+	return out, code
+}
+
+// runErr is run that also returns stderr.
+func (h *harness) runErr(t *testing.T, call string, req map[string]any) ([]byte, string, int) {
 	t.Helper()
 	req["contractVersion"] = intakecontract.ContractVersion
 	body, _ := json.Marshal(req)
@@ -99,7 +120,7 @@ func (h *harness) run(t *testing.T, call string, req map[string]any) ([]byte, in
 	} else if err != nil {
 		t.Fatal(err)
 	}
-	return out.Bytes(), code
+	return out.Bytes(), errb.String(), code
 }
 
 func TestDescribeIsAcceptedByTheRunnersRules(t *testing.T) {
@@ -184,10 +205,24 @@ func TestMarkTrackedAnswersOneObject(t *testing.T) {
 	}
 }
 
-func TestARefusalIsANonZeroExitWithOneLineOnStderr(t *testing.T) {
-	h := newHarness(t)
-	out, code := h.run(t, "list-untracked", map[string]any{"for": "nobody"})
-	if code == 0 || len(out) != 0 {
-		t.Fatalf("exit %d stdout %q: a refusal exits non-zero and prints nothing on stdout", code, out)
+func TestARefusalIsANonZeroExitWithOneLineOnStderrAndNothingOnStdout(t *testing.T) {
+	cases := map[string]struct {
+		config string
+		req    map[string]any
+		code   int
+	}{
+		"a malformed request (a team nobody leads)": {`{"repositories":["acme/app"]}`, map[string]any{"for": "nobody"}, 2},
+		"an upstream error with line breaks":        {`{"repositories":["broken/app"]}`, map[string]any{}, 1},
+	}
+	for name, tc := range cases {
+		h := newHarnessFor(t, tc.config)
+		out, errText, code := h.runErr(t, "list-untracked", tc.req)
+		if code != tc.code || len(out) != 0 {
+			t.Errorf("%s: exit %d stdout %q", name, code, out)
+		}
+		line := strings.TrimSuffix(errText, "\n")
+		if line == "" || strings.ContainsAny(line, "\n\x1b") || len(line) > 1000 {
+			t.Errorf("%s: stderr must be one actionable line, got %q", name, errText)
+		}
 	}
 }

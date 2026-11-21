@@ -65,3 +65,36 @@ func TestHostOf(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckRunsWithAMissingConfigAndExitsZero(t *testing.T) {
+	// No config file and no reachable GitHub: check still answers one JSON object
+	// and says why there is no config; the other calls refuse.
+	env := map[string]string{"GITHUB_ADAPTER_CONFIG": "/nonexistent/c.json", "GITHUB_API_URL": "https://127.0.0.1:1", "GITHUB_TOKEN": "t"}
+	code, out, errText := runCall(t, env, []string{"check"}, `{"contractVersion":1}`)
+	if code != 0 || errText != "" || !strings.Contains(out, `"configValid":false`) || !strings.Contains(out, "/nonexistent/c.json") || !strings.Contains(out, `"reachable":false`) {
+		t.Fatalf("%d %q %q", code, out, errText)
+	}
+	if code, _, _ := runCall(t, env, []string{"list-untracked"}, `{"contractVersion":1}`); code != 1 {
+		t.Errorf("list-untracked without a config must refuse, got %d", code)
+	}
+}
+
+func TestAPlainHTTPEndpointIsRefusedBeforeAnyRequest(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "c.json")
+	_ = os.WriteFile(cfg, []byte(`{"repositories":["a/b"]}`), 0o600)
+	env := map[string]string{"GITHUB_ADAPTER_CONFIG": cfg, "GITHUB_TOKEN": "t", "GITHUB_API_URL": "http://ghe.example.com/api/v3"}
+	code, out, errText := runCall(t, env, []string{"list-untracked"}, `{"contractVersion":1}`)
+	if code != 1 || out != "" || !strings.Contains(errText, "GITHUB_API_URL") || !strings.Contains(errText, "https") {
+		t.Fatalf("%d %q %q", code, out, errText)
+	}
+}
+
+func TestOneLineOnStderrWhateverTheUpstreamSaid(t *testing.T) {
+	got := oneLine("first\nsecond\x1b[31m‮end", 1000)
+	if strings.ContainsAny(got, "\n\x1b‮") || got != "first second [31m end" {
+		t.Fatalf("%q", got)
+	}
+	if n := len(oneLine(strings.Repeat("é", 2000), 1000)); n > 1000 {
+		t.Fatalf("not capped: %d", n)
+	}
+}
