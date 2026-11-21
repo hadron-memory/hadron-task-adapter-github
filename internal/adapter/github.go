@@ -399,14 +399,23 @@ func (c *Client) DeleteComment(ctx context.Context, repo string, id int64) error
 	return err
 }
 
+// ErrNoIdentity is Login's answer when GitHub says the credential has no
+// account (GET /user is refused or absent for it, as for an installation
+// token): the one case in which a configured commentAuthor is trusted.
+var ErrNoIdentity = errors.New("the credential names no account")
+
 // Login reads the authenticated account's login (a personal or fine-grained
 // token; an installation token has none, see Config.CommentAuthor).
 func (c *Client) Login(ctx context.Context) (string, error) {
 	var r struct {
 		Login string `json:"login"`
 	}
-	if _, err := c.do(ctx, http.MethodGet, c.API+"/user", nil, &r); err != nil {
-		return "", err
+	code, err := c.do(ctx, http.MethodGet, c.API+"/user", nil, &r)
+	if code == http.StatusNotFound || (code == http.StatusForbidden && err != nil && !strings.Contains(err.Error(), "rate limit")) {
+		return "", ErrNoIdentity // an installation token names no account
+	}
+	if err != nil {
+		return "", err // a failure to ask is not "no account"
 	}
 	if r.Login == "" {
 		return "", errors.New("GitHub did not name the account")

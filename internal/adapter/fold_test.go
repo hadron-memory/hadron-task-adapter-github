@@ -701,3 +701,46 @@ func TestAnEndpointWithAQueryOrFragmentIsRefused(t *testing.T) { // F5
 		}
 	}
 }
+
+// ---- fold 7 (LOCAL/BLIND: GET /user failing must not mean "trust the config") ----
+
+func TestAnIdentityLookupThatFailsTouchesNothing(t *testing.T) {
+	for _, op := range []string{"mark-tracked", "untrack"} {
+		f := newFake(t)
+		is := f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+		other := Comment{ID: 7, Body: trackedComment(taskIn{ID: "t-1"}, workerIn{Name: "Iris"})}
+		other.User.Login = "someone-else"
+		is.Comments = []Comment{other}
+		cfg := &Config{Repositories: []string{"acme/app"}, Comment: true, CommentAuthor: "someone-else"}
+		_ = cfg.normalize()
+		a := newAdapter(t, f, cfg)
+		f.FailNext["GET /user"] = true // HTTP 500
+		req := markRequest(issueURL("acme/app", 1))
+		if op == "untrack" {
+			req = `{"externalId":"` + issueURL("acme/app", 1) + `"}`
+		}
+		if _, r := call(t, a, op, req); r == nil {
+			t.Errorf("%s trusted the configured author when GitHub could not say who the credential is", op)
+		}
+		if len(f.Writes) != 0 || is.Comments[0].Body != other.Body {
+			t.Fatalf("%s wrote: %v", op, f.Writes)
+		}
+	}
+}
+
+func TestACredentialThatHasNoAccountTrustsTheConfiguredAuthor(t *testing.T) { // the documented installation case
+	for _, status := range []int{404, 403} {
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+		a := &Adapter{Config: &Config{CommentAuthor: "my-app[bot]"}, Client: &Client{API: srv.URL, Token: token, HTTP: srv.Client()}}
+		if got, err := a.ownLogin(context.Background()); err != nil || got != "my-app[bot]" {
+			t.Errorf("HTTP %d: %q %v", status, got, err)
+		}
+		srv.Close()
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) }))
+	defer srv.Close()
+	a := &Adapter{Config: &Config{CommentAuthor: "my-app[bot]"}, Client: &Client{API: srv.URL, Token: token, HTTP: srv.Client()}}
+	if _, err := a.ownLogin(context.Background()); err == nil {
+		t.Error("a refused credential (401) must not fall back to the configured author")
+	}
+}

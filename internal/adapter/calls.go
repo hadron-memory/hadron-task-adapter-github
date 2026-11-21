@@ -494,8 +494,14 @@ func (a *Adapter) ownLogin(ctx context.Context) (string, error) {
 		// edit another account's marker comments. An installation token names no
 		// account (GET /user is refused), so the configured login is trusted there
 		// and the author of a created comment is checked instead.
-		if actual, lerr := a.Client.Login(ctx); lerr == nil && !strings.EqualFold(actual, a.Config.CommentAuthor) {
+		actual, lerr := a.Client.Login(ctx)
+		switch {
+		case lerr == nil && !strings.EqualFold(actual, a.Config.CommentAuthor):
 			return "", &Refusal{Code: ExitRefused, Msg: "commentAuthor " + strconv.Quote(cleanText(a.Config.CommentAuthor, 64)) + " is not the credential's account " + strconv.Quote(cleanText(actual, 64)) + "; nothing was changed"}
+		case lerr != nil && !errors.Is(lerr, ErrNoIdentity):
+			// GitHub could not be asked who the credential is (an outage, a
+			// network failure): the identity is unverified, so nothing is touched.
+			return "", &Refusal{Code: ExitRefused, Msg: "could not verify that commentAuthor is the credential's account (" + cleanText(a.Client.scrub(lerr.Error()), 200) + "); nothing was changed, retry"}
 		}
 		return a.Config.CommentAuthor, nil
 	}
