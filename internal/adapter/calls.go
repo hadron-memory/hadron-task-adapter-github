@@ -378,6 +378,9 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 			return nil, &Refusal{Code: ExitUsage, Msg: "the worker is not an object of id, name, role and model"}
 		}
 	}
+	if a.noTrackerItem(q.ExternalID) {
+		return map[string]any{}, nil // no tracker item to write to: the tracker is not told
+	}
 	if a.Config.TrackedLabel == "" && !a.Config.Comment {
 		if _, _, err := a.parseExternalID(q.ExternalID); err != nil { // judged, but nothing to write
 			return nil, err
@@ -410,6 +413,9 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 }
 
 func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
+	if a.noTrackerItem(q.ExternalID) {
+		return map[string]any{}, nil // no tracker item to write to: the tracker is not told
+	}
 	if a.Config.TrackedLabel == "" && !a.Config.Comment {
 		if _, _, err := a.parseExternalID(q.ExternalID); err != nil {
 			return nil, err
@@ -445,6 +451,9 @@ func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
 }
 
 func (a *Adapter) report(ctx context.Context, q *request) (any, error) {
+	if a.noTrackerItem(q.ExternalID) {
+		return map[string]any{}, nil // no tracker item to write to: the tracker is not told
+	}
 	act, ok := a.Config.Report[strings.ToUpper(strings.TrimSpace(q.State))] // keys are normalized at load
 	if !ok {
 		if _, _, err := a.parseExternalID(q.ExternalID); err != nil {
@@ -762,19 +771,85 @@ func cursorBefore(k cursorKey, is Issue) bool {
 
 // ---- external ids and references ----
 
-// parseExternalID reads the canonical issue URL the adapter itself issued.
+// trackerURL is an external id read in one place for every caller that judges
+// one: parseExternalID (reads and writes) and noTrackerItem (the write guard).
+type trackerURL struct {
+	repo string // owner/name, lower case
+	n    int
+	kind string // "issues" or "pull"
+	frag string // the non-empty #fragment, or ""
+}
+
+var canonicalNumber = regexp.MustCompile(`^[1-9][0-9]{0,9}$`)
+
+// parseTrackerURL reads id as https://<host>/<owner>/<name>/(issues|pull)/<N>
+// with an optional non-empty #fragment, and nothing else: no query, no empty or
+// repeated fragment, no trailing slash or extra path, no encoded path, no
+// leading-zero or signed number, no userinfo.
+func (a *Adapter) parseTrackerURL(id string) (trackerURL, bool) {
+	base, frag, hasFrag := strings.Cut(id, "#")
+	if hasFrag && (frag == "" || strings.Contains(frag, "#")) {
+		return trackerURL{}, false
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawPath != "" ||
+		!strings.EqualFold(strings.TrimPrefix(u.Host, "www."), a.host()) {
+		return trackerURL{}, false
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) != 4 || (parts[2] != "issues" && parts[2] != "pull") || !canonicalNumber.MatchString(parts[3]) {
+		return trackerURL{}, false
+	}
+	repo := strings.ToLower(parts[0] + "/" + parts[1])
+	if !validRepo(repo) {
+		return trackerURL{}, false
+	}
+	n, _ := strconv.Atoi(parts[3])
+	return trackerURL{repo: repo, n: n, kind: parts[2], frag: frag}, true
+}
+
+// parseExternalID reads the issue URL a task holds: an issue in a listed
+// repository, with or without a #fragment (a read of a sub-claim reads its
+// issue).
 func (a *Adapter) parseExternalID(id string) (repo string, n int, err error) {
 	if err := checkExternalID(id); err != nil {
 		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId is not a valid id: " + err.Error()}
 	}
-	repo, n, ok := a.issueFromURL(id)
-	if !ok {
+	p, ok := a.parseTrackerURL(id)
+	if !ok || p.kind != "issues" {
 		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId is not an issue URL on " + a.host()}
 	}
-	if !a.Config.inRepositories(repo) {
+	if !a.Config.inRepositories(p.repo) {
 		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId names a repository the config does not list"}
 	}
-	return strings.ToLower(repo), n, nil
+	return p.repo, p.n, nil
+}
+
+// noTrackerItem reports whether the write call for q.ExternalID has no tracker
+// item to write to, so it changes nothing (no GitHub request at all) and
+// succeeds with the usual empty answer. Two shapes, both seen on real tasks:
+//   - an issue URL in a listed repository plus a #fragment: teams give several
+//     Hadron tasks one issue by suffixing a label (".../issues/2520#build"). The
+//     adapter never issued such an id, and the issue belongs to the task holding
+//     the bare URL, so a sub-claim must not label, comment on or release it.
+//   - a pull request URL in a listed repository (with or without a fragment):
+//     never an issue, so never written, and not an error either: a refusal holds
+//     the CLI's reconcile cursor, so every later run fails on one old task.
+//
+// Existence is deliberately not checked for these (no request is made): a
+// sub-claim has no item of its own, and a pull request is not this adapter's.
+// Anything else that is not a listed issue (another host, an unlisted
+// repository, a malformed or non-canonical id) is still refused by the call's
+// normal parse.
+func (a *Adapter) noTrackerItem(externalID string) bool {
+	if checkExternalID(externalID) != nil {
+		return false
+	}
+	p, ok := a.parseTrackerURL(externalID)
+	if !ok || !a.Config.inRepositories(p.repo) {
+		return false
+	}
+	return p.kind == "pull" || p.frag != ""
 }
 
 func (a *Adapter) host() string {

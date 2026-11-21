@@ -343,14 +343,13 @@ func TestMarkTrackedRefusals(t *testing.T) {
 	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
 	a := newAdapter(t, f, baseConfig())
 	for name, req := range map[string]string{
-		"a trailing space":   markRequest(issueURL("acme/app", 1) + " "),
-		"a pull request URL": markRequest("https://github.com/acme/app/pull/1"),
-		"another host":       markRequest("https://example.com/acme/app/issues/1"),
-		"userinfo":           markRequest("https://u:p@github.com/acme/app/issues/1"),
-		"an unlisted repo":   markRequest(issueURL("acme/other", 1)),
-		"no task":            `{"externalId":"` + issueURL("acme/app", 1) + `"}`,
-		"not a number":       markRequest("https://github.com/acme/app/issues/x"),
-		"http":               markRequest("http://github.com/acme/app/issues/1"),
+		"a trailing space": markRequest(issueURL("acme/app", 1) + " "),
+		"another host":     markRequest("https://example.com/acme/app/issues/1"),
+		"userinfo":         markRequest("https://u:p@github.com/acme/app/issues/1"),
+		"an unlisted repo": markRequest(issueURL("acme/other", 1)),
+		"no task":          `{"externalId":"` + issueURL("acme/app", 1) + `"}`,
+		"not a number":     markRequest("https://github.com/acme/app/issues/x"),
+		"http":             markRequest("http://github.com/acme/app/issues/1"),
 	} {
 		if _, r := call(t, a, "mark-tracked", req); r == nil || r.Code != ExitUsage {
 			t.Errorf("%s: %+v", name, r)
