@@ -370,6 +370,8 @@ type Comment struct {
 
 // ListComments reads an issue's comments, at most pages pages of 100. When the
 // last page read was full it refuses: the scan cannot say a comment is absent.
+// This refusal at the bound is deliberate and accepted (see the note in
+// upsertComment and adapter issue #5 for the Link-header refinement).
 func (c *Client) ListComments(ctx context.Context, repo string, n, pages int) ([]Comment, error) {
 	var all []Comment
 	for p := 1; p <= pages; p++ {

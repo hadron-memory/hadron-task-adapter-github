@@ -561,6 +561,11 @@ func (a *Adapter) upsertComment(ctx context.Context, repo string, n int, body st
 			return &Refusal{Code: ExitRefused, Msg: who + "; it was removed. Set commentAuthor to the credential's login"}
 		}
 		own, err = a.ownComments(ctx, repo, n)
+		// Accepted limitation (coordinator ruling, PR #3; tracked in adapter issue
+		// #5): past the 1,000-comment scan bound the adapter cannot verify that its
+		// comment is unique, so the first mark that crosses the bound succeeds on
+		// the comment GitHub named, and any later mark or untrack on that issue
+		// refuses by design (the README documents the refusal).
 		var lim commentLimit
 		if errors.As(err, &lim) { // the comment list is past the scan bound, but the write is known: GitHub named it
 			own, err = []Comment{created}, nil
