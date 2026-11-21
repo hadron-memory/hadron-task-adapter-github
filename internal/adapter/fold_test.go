@@ -1012,3 +1012,62 @@ func TestCheckSaysWhyWhen404OnRateLimitAndTheUserLookupFailsToo(t *testing.T) { 
 		t.Fatalf("%v", m)
 	}
 }
+
+// ---- ids that hold no tracker item: a #fragment sub-claim, a pull request (AT0.9506) ----
+
+func TestAWriteCallForAnIdWithNoTrackerItemChangesNothingAndSucceeds(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
+	cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true, Report: map[string]ReportAction{"CANCELLED": {AddLabels: []string{"x"}}}}
+	_ = cfg.normalize()
+	a := newAdapter(t, f, cfg)
+	for idName, id := range map[string]string{
+		"a #fragment sub-claim": issueURL("acme/app", 1) + "#build",
+		"a pull request":        "https://github.com/acme/app/pull/7",
+		"a pull request#sub":    "https://github.com/acme/app/pull/7#build",
+	} {
+		for name, req := range map[string]string{
+			"mark-tracked": markRequest(id),
+			"untrack":      `{"externalId":"` + id + `"}`,
+			"report":       `{"externalId":"` + id + `","state":"cancelled"}`,
+		} {
+			if _, r := call(t, a, name, req); r != nil {
+				t.Errorf("%s of %s was refused: %v", name, idName, r)
+			}
+		}
+	}
+	if len(f.Writes) != 0 || len(f.Requests) != 0 {
+		t.Fatalf("such an id must not touch the tracker at all: writes %v requests %v", f.Writes, f.Requests)
+	}
+}
+
+func TestAnIdThatIsNeitherAnIssueNorAKnownNoItemShapeIsStillRefused(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	a := newAdapter(t, f, baseConfig())
+	for name, id := range map[string]string{
+		"a pull request in an unlisted repository": "https://github.com/acme/other/pull/1",
+		"a pull request on another host":           "https://example.com/acme/app/pull/1",
+		"a pull request number that is not one":    "https://github.com/acme/app/pull/x",
+		"a fragment on an unlisted repository":     issueURL("acme/other", 1) + "#build",
+		"a fragment on another host":               "https://example.com/acme/app/issues/1#build",
+		"a fragment holding a space":               issueURL("acme/app", 1) + "#a b",
+		"a path that is neither":                   "https://github.com/acme/app/discussions/1",
+	} {
+		if _, r := call(t, a, "mark-tracked", markRequest(id)); r == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestABareIssueURLStillBehavesAsBefore(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	cfg := &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked"}
+	_ = cfg.normalize()
+	a := newAdapter(t, f, cfg)
+	mustCall(t, a, "mark-tracked", markRequest(issueURL("acme/app", 1)))
+	if len(f.Writes) == 0 {
+		t.Fatal("a bare issue URL must still be marked")
+	}
+}

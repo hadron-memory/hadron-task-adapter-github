@@ -378,6 +378,9 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 			return nil, &Refusal{Code: ExitUsage, Msg: "the worker is not an object of id, name, role and model"}
 		}
 	}
+	if a.holdsNoTrackerItem(q.ExternalID) {
+		return map[string]any{}, nil // no tracker item to write to: the tracker is not told
+	}
 	if a.Config.TrackedLabel == "" && !a.Config.Comment {
 		if _, _, err := a.parseExternalID(q.ExternalID); err != nil { // judged, but nothing to write
 			return nil, err
@@ -410,6 +413,9 @@ func (a *Adapter) markTracked(ctx context.Context, q *request) (any, error) {
 }
 
 func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
+	if a.holdsNoTrackerItem(q.ExternalID) {
+		return map[string]any{}, nil // no tracker item to write to: the tracker is not told
+	}
 	if a.Config.TrackedLabel == "" && !a.Config.Comment {
 		if _, _, err := a.parseExternalID(q.ExternalID); err != nil {
 			return nil, err
@@ -445,6 +451,9 @@ func (a *Adapter) untrack(ctx context.Context, q *request) (any, error) {
 }
 
 func (a *Adapter) report(ctx context.Context, q *request) (any, error) {
+	if a.holdsNoTrackerItem(q.ExternalID) {
+		return map[string]any{}, nil // no tracker item to write to: the tracker is not told
+	}
 	act, ok := a.Config.Report[strings.ToUpper(strings.TrimSpace(q.State))] // keys are normalized at load
 	if !ok {
 		if _, _, err := a.parseExternalID(q.ExternalID); err != nil {
@@ -775,6 +784,43 @@ func (a *Adapter) parseExternalID(id string) (repo string, n int, err error) {
 		return "", 0, &Refusal{Code: ExitUsage, Msg: "externalId names a repository the config does not list"}
 	}
 	return strings.ToLower(repo), n, nil
+}
+
+// holdsNoTrackerItem reports whether id names something the adapter has no
+// tracker item to write to, so a write call for it changes nothing and
+// succeeds. Two shapes, both seen on real tasks:
+//   - a valid in-scope issue URL plus a #fragment: teams give several Hadron
+//     tasks one issue by suffixing a label (".../issues/2520#build"). The adapter
+//     never issued such an id, and the issue belongs to the task holding the bare
+//     URL, so a sub-claim must not label, comment on or release it.
+//   - a pull request URL in a listed repository: never an issue, so never
+//     written (the label and comment endpoints would accept it), and not an error
+//     either: a refusal here holds the CLI's reconcile cursor, so every later
+//     run fails on one old task.
+//
+// Anything else that is not an issue (another host, an unlisted repository, a
+// malformed id) is still refused.
+func (a *Adapter) holdsNoTrackerItem(id string) bool {
+	if checkExternalID(id) != nil {
+		return false
+	}
+	if base, frag, ok := strings.Cut(id, "#"); ok && frag != "" && !strings.Contains(frag, "#") {
+		if _, _, err := a.parseExternalID(base); err == nil {
+			return true
+		}
+	}
+	u, err := url.Parse(id)
+	if err != nil || u.Scheme != "https" || u.User != nil || !strings.EqualFold(strings.TrimPrefix(u.Host, "www."), a.host()) {
+		return false
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 4 || parts[2] != "pull" {
+		return false
+	}
+	if n, err := strconv.Atoi(parts[3]); err != nil || n < 1 {
+		return false
+	}
+	return a.Config.inRepositories(parts[0] + "/" + parts[1])
 }
 
 func (a *Adapter) host() string {

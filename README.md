@@ -94,7 +94,14 @@ both) in a listed repository that exists, so a missing item is an error, not an
 (the label set, the comment not), the CLI keeps the claim and reports the failed
 mark, and running `mark-tracked` again completes it (the exception is an issue with 1,000 or more comments: there `mark-tracked` and `untrack` refuse before changing anything, label included, and rerunning does not help). Two simultaneous marks end
 with exactly one adapter comment (the oldest is kept and the adapter's own extras
-are deleted). The comment scan completes only below 1,000 comments; at 1,000 or more it refuses
+are deleted). Two kinds of external id have no tracker item to write to, and the
+three write calls (`mark-tracked`, `untrack`, `report`) **succeed without touching
+GitHub** for them: an issue URL with a `#fragment` (teams give several Hadron tasks
+one issue by suffixing a label, `.../issues/2520#build`; the issue belongs to the
+task that holds the bare URL), and a pull request URL in a listed repository. A
+refusal there would hold the CLI's reconcile cursor and fail every later run on one
+old task. Any other id that is not a listed-repository issue (another host, an
+unlisted repository, a malformed id) is still refused. The comment scan completes only below 1,000 comments; at 1,000 or more it refuses
 rather than guess the adapter has none.
 
 ## The calls

@@ -122,7 +122,7 @@ func TestTheCredentialNeverReachesStderr(t *testing.T) {
 }
 
 func TestCheckAnswersWhenTheClientCannotBeBuilt(t *testing.T) {
-	code, out, errText := runCall(t, map[string]string{"GITHUB_TOKEN": "ghp_testtoken", "GITHUB_API_URL": "http://x.example/ghp_testtoken"}, []string{"check"}, `{"contractVersion":1}`)
+	code, out, errText := runCall(t, map[string]string{"GITHUB_TOKEN": "ghp_testtoken", "GITHUB_API_URL": "http://x.example/ghp_testtoken", "GITHUB_ADAPTER_CONFIG": "/nonexistent/c.json"}, []string{"check"}, `{"contractVersion":1}`)
 	if code != 0 || errText != "" || !strings.Contains(out, `"configValid":false`) || !strings.Contains(out, `"credentialPresent":true`) || strings.Contains(out, "ghp_testtoken") {
 		t.Fatalf("%d %q %q", code, out, errText)
 	}
