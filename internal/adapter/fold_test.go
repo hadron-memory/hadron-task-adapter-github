@@ -1076,36 +1076,77 @@ func TestTheNoTrackerItemGuardKeepsTheCallsOwnInputChecks(t *testing.T) {
 	}
 }
 
-func TestAnIdThatIsNotAListedIssueOrAKnownNoItemShapeIsStillRefusedByEveryWriteCall(t *testing.T) {
+// The adapter writes only to a bare canonical issue URL in a listed repository
+// (what it issues). Every other id the CLI's reconcile hands it, including the
+// ids of other systems, is a no-op with no request at all: a refusal would hold
+// the CLI's reconcile cursor. The ids below that are not GitHub issues at all
+// are real ones from the live team data.
+func TestAnyIdThatIsNotABareListedIssueIsANoOpForEveryWriteCall(t *testing.T) {
 	f := newFake(t)
-	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
-	a := newAdapter(t, f, baseConfig())
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
+	cfg := mustNormalize(t, &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked", Comment: true, Report: map[string]ReportAction{"CANCELLED": {AddLabels: []string{"x"}}}})
+	a := newAdapter(t, f, cfg)
 	for name, id := range map[string]string{
-		"a pull request in an unlisted repository": "https://github.com/acme/other/pull/1",
-		"a pull request on another host":           "https://example.com/acme/app/pull/1",
-		"a pull request number that is not one":    "https://github.com/acme/app/pull/x",
-		"pull/0":                                   "https://github.com/acme/app/pull/0",
-		"a leading-zero number":                    "https://github.com/acme/app/pull/07",
-		"a signed number":                          "https://github.com/acme/app/pull/+7",
-		"a trailing slash":                         "https://github.com/acme/app/pull/7/",
-		"a path below the pull request":            "https://github.com/acme/app/pull/7/files",
-		"a query":                                  "https://github.com/acme/app/pull/7?x=1",
-		"an empty fragment":                        "https://github.com/acme/app/pull/7#",
-		"two fragments":                            "https://github.com/acme/app/pull/7#a#b",
-		"an encoded path":                          "https://github.com/acme/app/pull/%37",
-		"a fragment on an unlisted repository":     issueURL("acme/other", 1) + "#build",
-		"a fragment on another host":               "https://example.com/acme/app/issues/1#build",
-		"a fragment holding a space":               issueURL("acme/app", 1) + "#a b",
-		"a path that is neither":                   "https://github.com/acme/app/discussions/1",
-		"an issue with a query":                    issueURL("acme/app", 1) + "?x=1",
-		"an issue with a trailing slash":           issueURL("acme/app", 1) + "/",
-		"an issue with an empty fragment":          issueURL("acme/app", 1) + "#",
-		"an issue with two fragments":              issueURL("acme/app", 1) + "#a#b",
+		"an id of another system (CI run)":          "andi:4192:ci:aff802b39",
+		"an id of another system (ci-)":             "ci-4156-90b2a849",
+		"an id of another system (fit:)":            "fit:task-handles-s6",
+		"an issue in a repository the config lacks": "https://github.com/hadron-memory/hadron-client/issues/24",
+		"an issue in an unlisted repository":        issueURL("acme/other", 1),
+		"an issue on another host":                  "https://example.com/acme/app/issues/1",
+		"an http issue URL":                         "http://github.com/acme/app/issues/1",
+		"a pull request in an unlisted repository":  "https://github.com/acme/other/pull/1",
+		"a pull request on another host":            "https://example.com/acme/app/pull/1",
+		"a pull request number that is not one":     "https://github.com/acme/app/pull/x",
+		"pull/0":                                    "https://github.com/acme/app/pull/0",
+		"a leading-zero number":                     "https://github.com/acme/app/pull/07",
+		"a signed number":                           "https://github.com/acme/app/pull/+7",
+		"a trailing slash":                          "https://github.com/acme/app/pull/7/",
+		"a path below the pull request":             "https://github.com/acme/app/pull/7/files",
+		"a query":                                   "https://github.com/acme/app/pull/7?x=1",
+		"an empty fragment":                         "https://github.com/acme/app/pull/7#",
+		"two fragments":                             "https://github.com/acme/app/pull/7#a#b",
+		"an encoded path":                           "https://github.com/acme/app/pull/%37",
+		"a fragment on an unlisted repository":      issueURL("acme/other", 1) + "#build",
+		"a fragment on another host":                "https://example.com/acme/app/issues/1#build",
+		"a path that is neither":                    "https://github.com/acme/app/discussions/1",
+		"an issue with a query":                     issueURL("acme/app", 1) + "?x=1",
+		"an issue with a trailing slash":            issueURL("acme/app", 1) + "/",
+		"an issue with an empty fragment":           issueURL("acme/app", 1) + "#",
+		"an issue with two fragments":               issueURL("acme/app", 1) + "#a#b",
+		"an issue with a leading-zero number":       "https://github.com/acme/app/issues/01",
 	} {
 		for call2, req := range map[string]string{
 			"mark-tracked": markRequest(id),
 			"untrack":      `{"externalId":"` + id + `"}`,
 			"report":       `{"externalId":"` + id + `","state":"cancelled"}`,
+		} {
+			if m, r := call(t, a, call2, req); r != nil || len(m) != 0 {
+				t.Errorf("%s / %s: want the empty success, got %v %v", name, call2, m, r)
+			}
+		}
+	}
+	if len(f.Writes) != 0 || len(f.Requests) != 0 {
+		t.Fatalf("no id of that kind may reach the tracker: writes %v requests %v", f.Writes, f.Requests)
+	}
+}
+
+// What is still refused is an id the platform's own rules reject, which no task
+// can carry (whitespace, control characters, userinfo, over-long).
+func TestAnIdThatFailsThePlatformIDRulesIsStillRefusedByEveryWriteCall(t *testing.T) {
+	f := newFake(t)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
+	a := newAdapter(t, f, baseConfig())
+	for name, id := range map[string]string{
+		"a trailing space": issueURL("acme/app", 1) + " ",
+		"a control char":   "ci-1\u0007x",
+		"userinfo":         "https://u:p@github.com/acme/app/issues/1",
+		"a fragment space": issueURL("acme/app", 1) + "#a b",
+		"over-long":        "ci-" + strings.Repeat("x", 600),
+	} {
+		for call2, req := range map[string]string{
+			"mark-tracked": markRequest(id),
+			"untrack":      `{"externalId":` + strconv.Quote(id) + `}`,
+			"report":       `{"externalId":` + strconv.Quote(id) + `,"state":"cancelled"}`,
 		} {
 			if _, r := call(t, a, call2, req); r == nil {
 				t.Errorf("%s / %s: accepted", name, call2)
@@ -1130,20 +1171,22 @@ func TestABareIssueURLStillBehavesAsBeforeForEveryWriteCall(t *testing.T) {
 	}
 }
 
-func TestAWriteCallAcceptsAHostCaseAndWwwAndLowercasesTheRepository(t *testing.T) {
+func TestAWriteCallRecognisesAHostCaseWwwAndALowercasedRepositoryAndOnlyTheConfiguredHost(t *testing.T) {
 	f := newFake(t)
-	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z"})
-	a := newAdapter(t, f, mustNormalize(t, &Config{Repositories: []string{"acme/app"}}))
-	for _, id := range []string{"https://www.github.com/ACME/App/pull/7", "https://GitHub.com/acme/app/pull/7"} {
-		if _, r := call(t, a, "untrack", `{"externalId":"`+id+`"}`); r != nil {
-			t.Errorf("%s: %v", id, r)
+	f.add("acme/app", &fakeIssue{Number: 1, Title: "t", CreatedAt: "2026-01-01T00:00:00Z", Labels: []string{"hadron-tracked"}})
+	a := newAdapter(t, f, mustNormalize(t, &Config{Repositories: []string{"acme/app"}, TrackedLabel: "hadron-tracked"}))
+	for _, id := range []string{"https://www.github.com/ACME/App/issues/1", "https://GitHub.com/acme/app/issues/1"} {
+		before := len(f.Writes)
+		mustCall(t, a, "untrack", `{"externalId":"`+id+`"}`)
+		if len(f.Writes) <= before {
+			t.Errorf("%s is the bare listed issue and must be written", id)
 		}
 	}
+	// With another host configured, a github.com URL is not this adapter's item: no request.
 	a.Host = "ghe.example.com"
-	if _, r := call(t, a, "untrack", `{"externalId":"https://ghe.example.com/acme/app/pull/7"}`); r != nil {
-		t.Errorf("a non-default host: %v", r)
-	}
-	if _, r := call(t, a, "untrack", `{"externalId":"https://github.com/acme/app/pull/7"}`); r == nil {
-		t.Error("the default host is not this adapter's host when Host is set")
+	before, reqs := len(f.Writes), len(f.Requests)
+	mustCall(t, a, "untrack", `{"externalId":"https://github.com/acme/app/issues/1"}`)
+	if len(f.Writes) != before || len(f.Requests) != reqs {
+		t.Errorf("a github.com id is not the configured host's item, so nothing may be sent")
 	}
 }

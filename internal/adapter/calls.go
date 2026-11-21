@@ -825,31 +825,32 @@ func (a *Adapter) parseExternalID(id string) (repo string, n int, err error) {
 	return p.repo, p.n, nil
 }
 
-// noTrackerItem reports whether the write call for q.ExternalID has no tracker
-// item to write to, so it changes nothing (no GitHub request at all) and
-// succeeds with the usual empty answer. Two shapes, both seen on real tasks:
-//   - an issue URL in a listed repository plus a #fragment: teams give several
-//     Hadron tasks one issue by suffixing a label (".../issues/2520#build"). The
-//     adapter never issued such an id, and the issue belongs to the task holding
-//     the bare URL, so a sub-claim must not label, comment on or release it.
-//   - a pull request URL in a listed repository (with or without a fragment):
-//     never an issue, so never written, and not an error either: a refusal holds
-//     the CLI's reconcile cursor, so every later run fails on one old task.
+// noTrackerItem reports whether the write call for externalID has no tracker
+// item of this adapter to write to, so it changes nothing (no GitHub request
+// at all) and succeeds with the usual empty answer.
 //
-// Existence is deliberately not checked for these (no request is made): a
-// sub-claim has no item of its own, and a pull request is not this adapter's.
-// Anything else that is not a listed issue (another host, an unlisted
-// repository, a malformed or non-canonical id) is still refused by the call's
-// normal parse.
+// The adapter writes only to a bare, canonical issue URL in a listed
+// repository: the shape it issues. The CLI tells the adapter about EVERY Hadron
+// task that carries an external id, and on the live team data most of those are
+// not its items:
+//   - an issue URL plus a #fragment: teams give several Hadron tasks one issue by
+//     suffixing a label (".../issues/2520#build"); the issue belongs to the task
+//     holding the bare URL, so a sub-claim must not label, comment on or release it;
+//   - a pull request URL;
+//   - an issue or pull request in a repository this adapter does not list;
+//   - an id from another system altogether (CI run ids, "fit:..." markers).
+//
+// A refusal for any of these holds the CLI's reconcile cursor, so every later
+// run fails on one old task: the adapter says nothing and succeeds. Existence
+// is deliberately not checked. What is still refused is an id that fails the
+// platform's own id rules (checkExternalID: whitespace, control characters,
+// userinfo, over-long), which no task can carry.
 func (a *Adapter) noTrackerItem(externalID string) bool {
 	if checkExternalID(externalID) != nil {
 		return false
 	}
 	p, ok := a.parseTrackerURL(externalID)
-	if !ok || !a.Config.inRepositories(p.repo) {
-		return false
-	}
-	return p.kind == "pull" || p.frag != ""
+	return !(ok && p.kind == "issues" && p.frag == "" && a.Config.inRepositories(p.repo))
 }
 
 func (a *Adapter) host() string {
